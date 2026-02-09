@@ -1,3 +1,9 @@
+# Only track files under src/ (and this .gitignore)
+# Ignore all files and directories at repo root
+/*
+!.gitignore
+!/src
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
