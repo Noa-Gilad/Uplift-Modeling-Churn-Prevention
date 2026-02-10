@@ -21,15 +21,9 @@ from scipy.stats import chi2_contingency
 from sklearn.metrics.pairwise import cosine_similarity
 
 try:
-    from sentence_transformers import SentenceTransformer
-except Exception:
-    SentenceTransformer = None  # type: ignore[misc, assignment]
-try:
     from causalml.inference.meta import BaseSRegressor, BaseTRegressor, BaseXRegressor
-    from causalml.metrics import qini_auc_score
 except Exception:
     BaseSRegressor = BaseTRegressor = BaseXRegressor = None  # type: ignore[misc, assignment]
-    qini_auc_score = None
 try:
     from lightgbm import LGBMRegressor
     from xgboost import XGBRegressor
@@ -65,6 +59,21 @@ DOW_NAMES: dict[int, str] = {
 # ---------------------------------------------------------------------------
 # EDA helpers
 # ---------------------------------------------------------------------------
+
+
+def set_axes_clear(ax, x_axis_at_zero: bool = False) -> None:
+    """Set clear axes: y-axis at x=0 (left spine). If x_axis_at_zero, x-axis is at y=0 (hide bottom spine; caller must add axhline(0)); else show bottom spine as x-axis."""
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+    if x_axis_at_zero:
+        ax.spines["bottom"].set_visible(False)
+    else:
+        ax.spines["bottom"].set_visible(True)
+        ax.spines["bottom"].set_color("black")
+        ax.spines["bottom"].set_linewidth(1.2)
+    ax.spines["left"].set_visible(True)
+    ax.spines["left"].set_color("black")
+    ax.spines["left"].set_linewidth(1.2)
 
 
 def print_table_overview(name: str, df: pd.DataFrame) -> None:
@@ -238,7 +247,7 @@ def missingness_and_member_coverage(
                 bars = ax.bar(
                     cov["source"], cov["absent_pct"], color=sns.color_palette()[:3]
                 )
-                ax.set_ylabel("% of members with zero activity")
+                ax.set_ylabel("% with zero activity")
                 ax.set_xlabel("Source table")
                 ax.set_title("Members absent from each activity source (train)")
                 for bar, row in zip(bars, cov.itertuples()):
@@ -249,7 +258,8 @@ def missingness_and_member_coverage(
                         va="bottom",
                         fontsize=9,
                     )
-                plt.tight_layout()
+                set_axes_clear(ax, x_axis_at_zero=False)
+                fig.subplots_adjust(left=0.22, right=0.96, top=0.92, bottom=0.12)
                 plt.show()
 
 
@@ -389,6 +399,7 @@ def missingness_mechanism_analysis(
                     va="bottom",
                     fontsize=9,
                 )
+    set_axes_clear(ax, x_axis_at_zero=False)
     plt.tight_layout()
     plt.show()
 
@@ -433,10 +444,12 @@ def plot_balance(
         sns.countplot(data=data, x=x)
     else:
         sns.barplot(data=data, x=x, y=y)
+    ax = plt.gca()
     plt.title(title, fontsize=14, fontweight="bold")
     plt.xlabel(xlabel, fontsize=12)
     plt.ylabel(ylabel, fontsize=12)
     plt.tick_params(labelsize=11)
+    set_axes_clear(ax, x_axis_at_zero=False)
     plt.tight_layout()
     plt.show()
 
@@ -479,6 +492,7 @@ def feat_distribution_summary(
     ax.set_ylabel("Number of members", fontsize=11)
     ax.set_title(feat, fontsize=12, fontweight="bold")
     ax.grid(alpha=0.3)
+    set_axes_clear(ax, x_axis_at_zero=False)
     plt.tight_layout()
     plt.show()
 
@@ -571,6 +585,7 @@ def plot_feature_histograms(
             med, color="red", linestyle="--", linewidth=1, label=f"median={med:.1f}"
         )
         ax.legend(fontsize=7)
+        set_axes_clear(ax, x_axis_at_zero=False)
     for j in range(n, len(axes)):
         axes[j].set_visible(False)
     if suptitle:
@@ -621,6 +636,7 @@ def plot_correlation_diagnostics(
     plt.title(title, fontsize=14, fontweight="bold")
     plt.xlabel("Feature", fontsize=12)
     plt.ylabel("Feature", fontsize=12)
+    set_axes_clear(plt.gca(), x_axis_at_zero=False)
     plt.tight_layout()
     plt.show()
     print(f"\nPairs with |correlation| >= {threshold}:")
@@ -817,13 +833,16 @@ def plot_uplift_bars(
     ax.bar(
         range(len(bin_names)), uplifts, color="steelblue", edgecolor="black", alpha=0.85
     )
-    ax.axhline(0, color="black", linestyle="--", linewidth=1)
+    # Prominent horizontal line at y=0 (x-axis) so negative uplift is clearly below it
+    ax.axhline(0, color="black", linestyle="-", linewidth=1.5)
     ax.set_xticks(range(len(bin_names)))
     ax.set_xticklabels(bin_names, rotation=20, ha="right")
     ax.set_xlabel(xlabel, fontsize=12)
     ax.set_ylabel("Uplift (churn-rate difference)", fontsize=12)
     ax.set_title(title, fontsize=14, fontweight="bold")
     ax.grid(axis="y", alpha=0.3)
+    ax.tick_params(axis="both", which="major", length=5, width=1, labelsize=10)
+    set_axes_clear(ax, x_axis_at_zero=True)
     plt.tight_layout()
     plt.show()
 
@@ -1306,16 +1325,20 @@ def agg_app_features(
     members_df: pd.DataFrame,
     ref_date: pd.Timestamp,
 ) -> pd.DataFrame:
-    """Count app sessions per member up to the reference date.
+    """Count app sessions per member and days since last app session up to the reference date.
 
     Returns
     -------
     pd.DataFrame
-        Columns: member_id, app_sessions_count.
+        Columns: member_id, app_sessions_count, days_since_last_app.
     """
     adf = app_df[app_df["timestamp"] <= ref_date].copy()
     counts = adf.groupby("member_id").size().rename("app_sessions_count").reset_index()
+    last_app = adf.groupby("member_id")["timestamp"].max().reset_index()
+    last_app["days_since_last_app"] = (ref_date - last_app["timestamp"]).dt.days
+    last_app = last_app[["member_id", "days_since_last_app"]]
     out = members_df[["member_id"]].merge(counts, on="member_id", how="left")
+    out = out.merge(last_app, on="member_id", how="left")
     out["app_sessions_count"] = out["app_sessions_count"].fillna(0).astype(int)
     return out
 
@@ -1331,13 +1354,14 @@ def agg_claims_features(
     Returns
     -------
     pd.DataFrame
-        Columns: member_id, icd_distinct_count, has_focus_icd, days_since_last_claim.
+        Columns: member_id, claims_count, icd_distinct_count, has_focus_icd, days_since_last_claim.
     """
     if focus_icd_codes is None:
         focus_icd_codes = FOCUS_ICD_CODES
     cdf = claims_df[claims_df["diagnosis_date"] <= ref_date].copy()
     if cdf.empty:
         out = members_df[["member_id"]].copy()
+        out["claims_count"] = 0
         out["icd_distinct_count"] = 0
         out["has_focus_icd"] = 0
         out["days_since_last_claim"] = np.nan
@@ -1346,6 +1370,7 @@ def agg_claims_features(
     agg = (
         cdf.groupby("member_id")
         .agg(
+            claims_count=("diagnosis_date", "count"),
             icd_distinct_count=("icd_code", "nunique"),
             has_focus_icd=("_is_focus", "any"),
             _last_claim=("diagnosis_date", "max"),
@@ -1356,6 +1381,7 @@ def agg_claims_features(
     agg["days_since_last_claim"] = (ref_date - agg["_last_claim"]).dt.days
     agg.drop(columns="_last_claim", inplace=True)
     out = members_df[["member_id"]].merge(agg, on="member_id", how="left")
+    out["claims_count"] = out["claims_count"].fillna(0).astype(int)
     out["icd_distinct_count"] = out["icd_distinct_count"].fillna(0).astype(int)
     out["has_focus_icd"] = out["has_focus_icd"].fillna(0).astype(int)
     return out
@@ -1581,7 +1607,7 @@ def assign_segments(uplift_scores: np.ndarray) -> np.ndarray:
     return seg
 
 
-def _build_model(meta_key: str, base_key: str, spw: float):
+def build_model(meta_key: str, base_key: str, spw: float):
     """Instantiate a CausalML meta-learner with the requested base learner.
 
     Parameters
