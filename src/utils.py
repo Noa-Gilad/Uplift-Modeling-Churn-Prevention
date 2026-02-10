@@ -438,39 +438,280 @@ def plot_balance(
     plt.show()
 
 
-def engagement_feat_summary(
-    eng: pd.DataFrame,
+def feat_distribution_summary(
+    data: pd.DataFrame,
     feat: str,
     bins: int = 50,
+    color: str | None = None,
 ) -> None:
-    """Print quantile summary and show a log-scaled histogram for one engagement feature.
+    """Print quantile summary and show a log-scaled histogram for one numeric feature.
 
-    Used for distribution sanity checks: call once per feature (e.g. web_visits_count,
-    app_sessions_count, url_nunique). Plots log(1 + values) to handle skew.
+    Reusable for distribution sanity checks: engagement (web_visits_count, app_sessions_count,
+    url_nunique), claims (claims_count, icd_nunique), or any other zero-filled count-like column.
+    Plots log(1 + values) to handle skew.
 
     Parameters
     ----------
-    eng : pandas.DataFrame
-        Engagement dataframe with at least the column named by feat (zero-filled).
+    data : pandas.DataFrame
+        DataFrame with at least the column named by feat (zero-filled or numeric).
     feat : str
-        Column name to summarize and plot (e.g. 'web_visits_count', 'app_sessions_count', 'url_nunique').
+        Column name to summarize and plot.
     bins : int, optional
         Number of histogram bins (default 50).
+    color : str or None, optional
+        Bar color for the histogram. If None, default matplotlib color is used.
 
     Returns
     -------
     None
     """
     print(f"\n{feat}:")
-    print(eng[feat].quantile([0, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99, 1]).to_string())
+    print(data[feat].quantile([0, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99, 1]).to_string())
     fig, ax = plt.subplots(figsize=(5, 4))
-    ax.hist(np.log1p(eng[feat]), bins=bins, edgecolor="black", alpha=0.7)
+    kwargs: dict = {"bins": bins, "edgecolor": "black", "alpha": 0.7}
+    if color is not None:
+        kwargs["color"] = color
+    ax.hist(np.log1p(data[feat]), **kwargs)
     ax.set_xlabel(f"log(1 + {feat})", fontsize=11)
     ax.set_ylabel("Number of members", fontsize=11)
     ax.set_title(feat, fontsize=12, fontweight="bold")
     ax.grid(alpha=0.3)
     plt.tight_layout()
     plt.show()
+
+
+def feature_diagnostics(
+    df: pd.DataFrame,
+    feature_cols: list[str],
+    title_suffix: str = "",
+) -> None:
+    """Print feature summary statistics and zeros/missing percentages for selected columns.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        DataFrame containing the feature columns (e.g. train_features).
+    feature_cols : list of str
+        Column names to summarize.
+    title_suffix : str, optional
+        Suffix for section headers (e.g. '(train)').
+
+    Returns
+    -------
+    None
+    """
+    subset = df[feature_cols]
+    print("=" * 70)
+    print(f"FEATURE SUMMARY STATISTICS {title_suffix}".strip())
+    print("=" * 70)
+    print(subset.describe().T.to_string())
+    print("\n" + "=" * 70)
+    print(f"ZEROS AND MISSING VALUES {title_suffix}".strip())
+    print("=" * 70)
+    n = len(df)
+    for col in feature_cols:
+        pct_zero = (df[col] == 0).sum() / n * 100
+        pct_miss = df[col].isna().sum() / n * 100
+        print(f"  {col:<35s}  zeros: {pct_zero:6.2f}%   missing: {pct_miss:6.2f}%")
+
+
+def plot_feature_histograms(
+    df: pd.DataFrame,
+    feature_cols: list[str],
+    xlabels: dict[str, str] | None = None,
+    figsize: tuple[int, int] = (18, 8),
+    bins: int = 40,
+    ncols: int = 4,
+    suptitle: str | None = None,
+) -> None:
+    """Plot a grid of histograms (one per feature) with median line and optional custom x-labels.
+
+    Each subplot: x = feature value, y = count of members; red dashed vertical line at median.
+    Unused subplots (when len(feature_cols) < nrows * ncols) are hidden.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        DataFrame containing the feature columns (e.g. train_features).
+    feature_cols : list of str
+        Column names to plot, in order.
+    xlabels : dict of str -> str or None, optional
+        Map feature column name -> x-axis label. If None, column name is used.
+    figsize : tuple of (int, int), optional
+        Figure size (default (18, 8)).
+    bins : int, optional
+        Number of histogram bins per subplot (default 40).
+    ncols : int, optional
+        Number of columns in the grid (default 4).
+    suptitle : str or None, optional
+        Figure suptitle. If None, no suptitle.
+
+    Returns
+    -------
+    None
+    """
+    if xlabels is None:
+        xlabels = {}
+    n = len(feature_cols)
+    nrows = (n + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=figsize)
+    axes = np.atleast_1d(axes).flatten()
+    for i, col in enumerate(feature_cols):
+        ax = axes[i]
+        data = df[col].dropna()
+        ax.hist(data, bins=bins, edgecolor="white", alpha=0.8)
+        ax.set_title(col, fontsize=10, fontweight="bold")
+        ax.set_xlabel(xlabels.get(col, col), fontsize=10)
+        ax.set_ylabel("Number of members", fontsize=10)
+        med = data.median()
+        ax.axvline(
+            med, color="red", linestyle="--", linewidth=1, label=f"median={med:.1f}"
+        )
+        ax.legend(fontsize=7)
+    for j in range(n, len(axes)):
+        axes[j].set_visible(False)
+    if suptitle:
+        plt.suptitle(suptitle, fontsize=14, fontweight="bold", y=1.02)
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_correlation_diagnostics(
+    df: pd.DataFrame,
+    feature_cols: list[str],
+    threshold: float = 0.8,
+    title_suffix: str = "",
+    figsize: tuple[int, int] = (10, 8),
+) -> None:
+    """Plot feature correlation heatmap and print pairs with |r| >= threshold.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        DataFrame containing the feature columns (e.g. train_features).
+    feature_cols : list of str
+        Column names to include in the correlation matrix.
+    threshold : float, optional
+        Minimum |correlation| to flag (default 0.8).
+    title_suffix : str, optional
+        Suffix for the plot title (e.g. '(train set)').
+    figsize : tuple of (int, int), optional
+        Figure size (default (10, 8)).
+
+    Returns
+    -------
+    None
+    """
+    corr = df[feature_cols].corr()
+    plt.figure(figsize=figsize)
+    sns.heatmap(
+        corr,
+        annot=True,
+        fmt=".2f",
+        cmap="coolwarm",
+        vmin=-1,
+        vmax=1,
+        square=True,
+        linewidths=0.5,
+    )
+    title = f"Feature Correlation Matrix {title_suffix}".strip()
+    plt.title(title, fontsize=14, fontweight="bold")
+    plt.xlabel("Feature", fontsize=12)
+    plt.ylabel("Feature", fontsize=12)
+    plt.tight_layout()
+    plt.show()
+    print(f"\nPairs with |correlation| >= {threshold}:")
+    flagged: list[tuple[str, str, float]] = []
+    for i in range(len(feature_cols)):
+        for j in range(i + 1, len(feature_cols)):
+            r = corr.iloc[i, j]
+            if abs(r) >= threshold:
+                flagged.append((feature_cols[i], feature_cols[j], r))
+                print(f"  {feature_cols[i]}  ↔  {feature_cols[j]}  :  r = {r:.3f}")
+    if not flagged:
+        print("  (none)")
+
+
+def build_claims_labels(
+    claims: pd.DataFrame,
+    churn_labels: pd.DataFrame,
+    focus_icd_codes: list[str] | None = None,
+) -> pd.DataFrame:
+    """Build claims-and-labels dataframe: member_id, churn, outreach, claims_count, icd_nunique, has_focus_icd, focus_icd_count.
+
+    Aggregates claims by member (count, unique ICDs, focus-ICD flag and count), merges with
+    churn_labels, and zero-fills missing values. Used for claims distribution sanity checks
+    and uplift-by-claims-strata analyses.
+
+    Parameters
+    ----------
+    claims : pandas.DataFrame
+        Claims table with member_id and icd_code.
+    churn_labels : pandas.DataFrame
+        Labels with member_id, churn, outreach.
+    focus_icd_codes : list of str or None, optional
+        ICD codes to treat as focus (e.g. WellCo clinical focus). If None, uses FOCUS_ICD_CODES.
+
+    Returns
+    -------
+    pandas.DataFrame
+        One row per member: member_id, churn, outreach, claims_count, icd_nunique, has_focus_icd, focus_icd_count (all filled, no NaN).
+    """
+    if focus_icd_codes is None:
+        focus_icd_codes = FOCUS_ICD_CODES
+    claims_per = claims.groupby("member_id").size().rename("claims_count").reset_index()
+    icd_nun = (
+        claims.groupby("member_id")["icd_code"]
+        .nunique()
+        .rename("icd_nunique")
+        .reset_index()
+    )
+    claims_f = claims.copy()
+    claims_f["is_focus"] = claims_f["icd_code"].isin(focus_icd_codes)
+    focus_any = (
+        claims_f.groupby("member_id")["is_focus"]
+        .any()
+        .rename("has_focus_icd")
+        .reset_index()
+    )
+    focus_count = (
+        claims_f[claims_f["is_focus"]]
+        .groupby("member_id")["icd_code"]
+        .nunique()
+        .rename("focus_icd_count")
+        .reset_index()
+    )
+    cl = (
+        churn_labels[["member_id", "churn", "outreach"]]
+        .merge(claims_per, on="member_id", how="left")
+        .merge(icd_nun, on="member_id", how="left")
+        .merge(focus_any, on="member_id", how="left")
+        .merge(focus_count, on="member_id", how="left")
+    )
+    cl["claims_count"] = cl["claims_count"].fillna(0)
+    cl["icd_nunique"] = cl["icd_nunique"].fillna(0)
+    cl["has_focus_icd"] = cl["has_focus_icd"].fillna(False).astype(int)
+    cl["focus_icd_count"] = cl["focus_icd_count"].fillna(0).astype(int)
+    return cl
+
+
+def print_focus_icd_stats(cl: pd.DataFrame) -> None:
+    """Print focus-ICD prevalence and focus_icd_count distribution for a claims-labels dataframe.
+
+    Assumes cl was produced by build_claims_labels (columns has_focus_icd, focus_icd_count).
+
+    Parameters
+    ----------
+    cl : pandas.DataFrame
+        Claims-labels dataframe from build_claims_labels.
+
+    Returns
+    -------
+    None
+    """
+    print(f"\nFocus-ICD prevalence: {cl['has_focus_icd'].mean():.3f}")
+    print("\nFocus-ICD count distribution:")
+    print(cl["focus_icd_count"].value_counts().sort_index().to_string())
 
 
 def count_events_before_signup(
@@ -834,6 +1075,190 @@ def filter_wellco_relevant_visits(
         f"(threshold={similarity_threshold})"
     )
     return relevant
+
+
+def run_relevance_filter_sanity_check(
+    wellco_embedding: np.ndarray,
+    embed_model: "ST",
+    similarity_threshold: float | None = None,
+    ref_date: pd.Timestamp | None = None,
+) -> None:
+    """Run a sanity check that the WellCo relevance filter behaves as expected on a fixture.
+
+    Uses a small fixture of web visits with known relevant/irrelevant titles and asserts
+    that filter_wellco_relevant_visits retains the correct counts per member and does
+    not let through non-relevant content. Raises AssertionError if any check fails.
+
+    Parameters
+    ----------
+    wellco_embedding : np.ndarray
+        Pre-computed WellCo brief embedding, shape (1, dim).
+    embed_model : SentenceTransformer
+        Pre-loaded embedding model.
+    similarity_threshold : float or None
+        Threshold for cosine similarity; if None, uses SIMILARITY_THRESHOLD.
+    ref_date : pd.Timestamp or None
+        Reference date for filtering visits; if None, uses 2025-08-15.
+
+    Returns
+    -------
+    None
+    """
+    if similarity_threshold is None:
+        similarity_threshold = SIMILARITY_THRESHOLD
+    if ref_date is None:
+        ref_date = pd.Timestamp("2025-08-15")
+
+    # Ground-truth grouping of the 26 unique (title, description) pairs in the
+    # web-visits data, classified by WellCo brief alignment.
+    wellco_relevant_titles: set[str] = {
+        "Diabetes management",
+        "Hypertension basics",
+        "Stress reduction",
+        "Restorative sleep tips",
+        "Healthy eating guide",
+        "Aerobic exercise",
+        "HbA1c targets",
+        "Strength training basics",
+        "Lowering blood pressure",
+        "Sleep hygiene",
+        "Mediterranean diet",
+        "Cardio workouts",
+        "Exercise routines",
+        "Meditation guide",
+        "Cardiometabolic health",
+        "High-fiber meals",
+        "Cholesterol friendly foods",
+        "Weight management",
+    }
+    not_relevant_titles: set[str] = {
+        "Gadget roundup",
+        "Game reviews",
+        "New releases",
+        "Dog training",
+        "Electric vehicles",
+        "Budget planning",
+        "Match highlights",
+        "Top destinations",
+    }
+    assert len(wellco_relevant_titles) + len(not_relevant_titles) == 26, (
+        "Expected 26 unique titles total"
+    )
+
+    # Fixture: different members and mix of titles to verify threshold generalizes.
+    test_rows = [
+        (
+            10,
+            "https://x.com/1",
+            "Stress reduction",
+            "Mindfulness and wellness",
+            "2025-08-01 10:00:00",
+        ),
+        (
+            10,
+            "https://x.com/2",
+            "Healthy eating guide",
+            "Nutrition and balanced diet",
+            "2025-08-02 11:00:00",
+        ),
+        (
+            10,
+            "https://x.com/3",
+            "Gadget roundup",
+            "Smartphones and laptops news",
+            "2025-08-03 12:00:00",
+        ),
+        (
+            11,
+            "https://y.com/1",
+            "Cardio workouts",
+            "Exercise and recovery",
+            "2025-08-04 09:00:00",
+        ),
+        (
+            11,
+            "https://y.com/2",
+            "Meditation guide",
+            "Mindfulness and relaxation",
+            "2025-08-05 10:00:00",
+        ),
+        (
+            11,
+            "https://y.com/3",
+            "Aerobic exercise",
+            "Cardio and endurance",
+            "2025-08-06 11:00:00",
+        ),
+        (
+            11,
+            "https://y.com/4",
+            "New releases",
+            "Box office and trailers",
+            "2025-08-07 14:00:00",
+        ),
+        (
+            12,
+            "https://z.com/1",
+            "Match highlights",
+            "League standings and transfers",
+            "2025-08-08 08:00:00",
+        ),
+        (
+            12,
+            "https://z.com/2",
+            "Top destinations",
+            "City guides and itineraries",
+            "2025-08-09 16:00:00",
+        ),
+    ]
+    test_web = pd.DataFrame(
+        test_rows,
+        columns=["member_id", "url", "title", "description", "timestamp"],
+    )
+    test_web["timestamp"] = pd.to_datetime(test_web["timestamp"])
+
+    filtered = filter_wellco_relevant_visits(
+        test_web,
+        wellco_embedding=wellco_embedding,
+        embed_model=embed_model,
+        similarity_threshold=similarity_threshold,
+        ref_date=ref_date,
+    )
+
+    counts = filtered.groupby("member_id").size()
+    unique_urls = filtered.groupby("member_id")["url"].nunique()
+
+    assert counts.get(10, 0) == 2, (
+        f"Member 10: expected 2 relevant visits, got {counts.get(10, 0)}"
+    )
+    assert counts.get(11, 0) == 3, (
+        f"Member 11: expected 3 relevant visits, got {counts.get(11, 0)}"
+    )
+    assert counts.get(12, 0) == 0, (
+        f"Member 12: expected 0 relevant visits, got {counts.get(12, 0)}"
+    )
+    assert unique_urls.get(10, 0) == 2, (
+        f"Member 10: expected 2 unique URLs, got {unique_urls.get(10, 0)}"
+    )
+    assert unique_urls.get(11, 0) == 3, (
+        f"Member 11: expected 3 unique URLs, got {unique_urls.get(11, 0)}"
+    )
+
+    assert filtered["title"].isin(not_relevant_titles).sum() == 0, (
+        "Filter let through visits with non-relevant titles!"
+    )
+    assert filtered["title"].isin(wellco_relevant_titles).all(), (
+        "Filter retained titles outside the expected relevant set!"
+    )
+
+    print("✓ All relevance-filter sanity checks passed.")
+    print(
+        f"  Member 10: {counts.get(10, 0)} visits, {unique_urls.get(10, 0)} unique URLs"
+    )
+    print(
+        f"  Member 11: {counts.get(11, 0)} visits, {unique_urls.get(11, 0)} unique URLs"
+    )
+    print(f"  Member 12: {counts.get(12, 0)} visits (correctly excluded)")
 
 
 def agg_web_features(
