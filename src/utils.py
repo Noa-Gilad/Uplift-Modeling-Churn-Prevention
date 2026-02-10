@@ -3,6 +3,9 @@ Utility functions for uplift churn modeling: EDA, feature engineering, and model
 
 This module is intended to be imported by the uplift_churn_modeling notebook.
 All logic is documented in docstrings; see the notebook for end-to-end workflow.
+
+Data paths: not defined here. Callers (notebooks) use BASE_DIR / 'files' for data,
+e.g. files/train/, files/test/, files/wellco_client_brief.txt.
 """
 
 from __future__ import annotations
@@ -949,6 +952,8 @@ def build_recency_tenure(
 
 def load_wellco_brief(path: Path | str) -> str:
     """Read the WellCo client brief from disk and return it as a single string.
+
+    Caller typically passes e.g. (BASE_DIR / 'files' / 'wellco_client_brief.txt').
 
     Parameters
     ----------
