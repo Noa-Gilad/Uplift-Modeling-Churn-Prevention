@@ -26,9 +26,9 @@ try:
 except Exception:
     BaseSRegressor = BaseTRegressor = None  # type: ignore[misc, assignment]
 try:
-    from causalml.metrics import qini_auc_score as causalml_qini_auc
+    from causalml.metrics import qini_score as causalml_qini_score
 except Exception:
-    causalml_qini_auc = None  # type: ignore[misc, assignment]
+    causalml_qini_score = None  # type: ignore[misc, assignment]
 try:
     from lightgbm import LGBMRegressor
     from xgboost import XGBRegressor
@@ -1481,44 +1481,20 @@ def build_feature_matrix(
 
 
 def make_lgbm():
-    """Create a LightGBM regressor configured for shallow, regularised trees."""
+    """Create a LightGBM regressor with default hyperparameters (S/T-learner base)."""
     if LGBMRegressor is None:
         raise ImportError("lightgbm is not installed")
-    return LGBMRegressor(
-        n_estimators=300,
-        learning_rate=0.05,
-        max_depth=4,
-        num_leaves=31,
-        min_child_samples=100,
-        subsample=0.9,
-        colsample_bytree=0.9,
-        reg_alpha=0.1,
-        reg_lambda=1.0,
-        class_weight="balanced",
-        random_state=RANDOM_STATE,
-        verbose=-1,
-    )
+    return LGBMRegressor(random_state=RANDOM_STATE, verbose=-1)
 
 
 def make_xgb(scale_pos_weight: float = 1.0):
-    """Create an XGBoost regressor configured for shallow, regularised trees."""
+    """Create an XGBoost regressor with default hyperparameters (S/T-learner base)."""
     if XGBRegressor is None:
         raise ImportError("xgboost is not installed")
     return XGBRegressor(
-        n_estimators=300,
-        learning_rate=0.05,
-        max_depth=4,
-        min_child_weight=5,
-        subsample=0.9,
-        colsample_bytree=0.9,
-        reg_alpha=0.1,
-        reg_lambda=1.0,
-        scale_pos_weight=scale_pos_weight,
-        objective="binary:logistic",
-        eval_metric="logloss",
         random_state=RANDOM_STATE,
+        scale_pos_weight=scale_pos_weight,
         verbosity=0,
-        n_jobs=-1,
     )
 
 
@@ -1530,6 +1506,10 @@ def uplift_at_k(
 ) -> float:
     """Realised uplift in the top-k fraction of the population ranked by predicted uplift.
 
+    Convention: callers should pass **negated** CausalML CATE for churn tasks
+    (i.e. ``-CATE``) so that individuals who benefit most from treatment
+    (most negative CATE → most positive -CATE) are ranked first.
+
     Parameters
     ----------
     y_true : array of int
@@ -1537,14 +1517,16 @@ def uplift_at_k(
     t_true : array of int
         Treatment indicator (1 = outreach, 0 = control).
     uplift_scores : array of float
-        Predicted uplift (higher = more benefit from treatment).
+        Predicted uplift (higher = more benefit from treatment).  For churn,
+        pass ``-CATE`` so that persuadables rank first.
     k : float in (0, 1]
         Fraction of the population to consider (e.g. 0.10 for top 10%).
 
     Returns
     -------
     float
-        churn_rate_control - churn_rate_treated in the top-k segment.
+        churn_rate_control − churn_rate_treated in the top-k segment.
+        Positive when treatment reduces churn in the selected segment.
     """
     n = max(1, int(len(uplift_scores) * k))
     idx = np.argsort(-uplift_scores)[:n]
@@ -1564,12 +1546,15 @@ def uplift_curve(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Cumulative uplift curve evaluated at n_points fractions.
 
+    Like :func:`uplift_at_k`, callers should pass ``-CATE`` for churn tasks
+    so that persuadables are ranked first.
+
     Returns
     -------
     ks : np.ndarray
         Fraction values (0.01 ... 1.0).
     uplift_vals : np.ndarray
-        Realised uplift at each fraction.
+        Realised uplift (churn_control − churn_treated) at each fraction.
     """
     order = np.argsort(-uplift_scores)
     y_sorted = y_true[order]
@@ -1645,7 +1630,14 @@ def qini_coefficient(
     treatment: np.ndarray,
     uplift_scores: np.ndarray,
 ) -> float:
-    """Compute Qini coefficient (normalized area under Qini curve) when causalml is available.
+    """Compute Qini coefficient (normalised area between model and random Qini curves).
+
+    Delegates to CausalML's ``qini_score``, which internally sorts by
+    descending ``uplift_scores`` and computes a Qini curve using
+    ``treated_outcome − control_outcome``.  Callers should pass the **raw**
+    CATE (not negated) so that CausalML's ranking is consistent with its
+    internal formula.  A positive Qini means the model correctly
+    discriminates individuals by their treatment effect.
 
     Parameters
     ----------
@@ -1654,17 +1646,25 @@ def qini_coefficient(
     treatment : np.ndarray
         Treatment indicator (1 = treated, 0 = control).
     uplift_scores : np.ndarray
-        Predicted uplift per sample.
+        **Raw** predicted CATE per sample (E[Y|T=1] − E[Y|T=0]).
 
     Returns
     -------
     float
         Qini coefficient, or np.nan if causalml.metrics is not available.
     """
-    if causalml_qini_auc is None:
+    if causalml_qini_score is None:
         return np.nan
     try:
-        return float(causalml_qini_auc(y_true, uplift_scores, treatment))
+        # CausalML qini_score(df) expects outcome_col, treatment_col, and one or more *model* columns (predicted uplift).
+        # Do not set treatment_effect_col so that our prediction column is used as the model column.
+        df_qini = pd.DataFrame(
+            {"y": y_true, "w": treatment, "pred": np.asarray(uplift_scores).ravel()}
+        )
+        result = causalml_qini_score(
+            df_qini, outcome_col="y", treatment_col="w", normalize=True
+        )
+        return float(result.iloc[0]) if hasattr(result, "iloc") else float(result)
     except Exception:
         return np.nan
 
@@ -1683,8 +1683,8 @@ def run_uplift_cv(
     """Run stratified K-fold CV for each uplift candidate; return per-fold metrics.
 
     Stratification is by 2*treatment + y so treatment/control and outcome balance
-    are preserved. For each fold and candidate: fit on train, predict on val,
-    compute AUUC, Qini, uplift@k. Records n_val, n_treated_val, n_control_val per fold.
+    are preserved in each fold. For each fold and candidate: fit on train, predict
+    on val, compute AUUC, Qini, uplift@k. Records n_val, n_treated_val, n_control_val per fold.
 
     Parameters
     ----------
@@ -1712,10 +1712,22 @@ def run_uplift_cv(
     list of dict
         Each dict: candidate, fold, auuc, qini, uplift_at_k_*, n_val, n_treated_val, n_control_val.
     """
-    from sklearn.model_selection import StratifiedKFold
-
     if uplift_k_fracs is None:
         uplift_k_fracs = [0.05, 0.1, 0.2]
+    # Keep only rows with valid outcome (0/1) and treatment (0/1); drop NaN or invalid so metrics are correct.
+    y_ = np.asarray(y, dtype=np.float64)
+    t_ = np.asarray(treatment, dtype=np.float64)
+    valid = np.isfinite(y_) & np.isin(t_, (0.0, 1.0)) & np.isin(y_, (0.0, 1.0))
+    if not np.all(valid):
+        X = X.loc[valid] if isinstance(X, pd.DataFrame) else X[valid]
+        y = np.asarray(y_[valid], dtype=np.float64)
+        treatment = np.asarray(t_[valid], dtype=np.float64)
+        # Ensure integer 0/1 for stratification and indexing
+        y = (y > 0.5).astype(np.int64)
+        treatment = (treatment > 0.5).astype(np.int64)
+    else:
+        y = (np.asarray(y, dtype=np.float64) > 0.5).astype(np.int64)
+        treatment = (np.asarray(treatment, dtype=np.float64) > 0.5).astype(np.int64)
     results: list[dict] = []
     # CausalML converts X to numpy before calling the base learner; sklearn then warns "X does not have valid
     # feature names" at predict. Suppress that specific warning so output is clean.
@@ -1773,11 +1785,26 @@ def _run_uplift_cv_loop(
             model = build_model(meta_key, base_key, scale_pos_weight)
             model.fit(X_tr, t_tr, y_tr)
             pred = model.predict(X_val)
-            # CausalML predict returns (n_samples, n_treatment_groups); flatten to 1D for uplift_curve and metrics.
-            pred = np.asarray(pred).ravel()
-            ks, uplift_vals = uplift_curve(y_val, t_val, pred, n_points=n_curve_points)
+            # CausalML predict returns CATE = E[Y|T=1] - E[Y|T=0].
+            # For churn (Y=1 bad), negative CATE means treatment helps.
+            raw_pred = np.asarray(pred).ravel()  # raw CATE for CausalML Qini
+            neg_pred = -raw_pred  # negated: higher = more benefit
+
+            # Our custom metrics use negated CATE so persuadables (most negative
+            # CATE → most positive -CATE) rank first; formula is
+            # control_churn − treated_churn, which is positive when treatment helps.
+            ks, uplift_vals = uplift_curve(
+                y_val, t_val, neg_pred, n_points=n_curve_points
+            )
             auuc = approx_auuc(ks, uplift_vals)
-            qini = qini_coefficient(y_val, t_val, pred)
+
+            # CausalML's qini_score sorts by descending prediction and internally
+            # computes treated_outcome − control_outcome.  It expects raw CATE
+            # (positive CATE = treatment increases Y).  A model that correctly
+            # ranks individuals by their CATE produces a positive Qini regardless
+            # of whether Y=1 is "good" or "bad".
+            qini = qini_coefficient(y_val, t_val, raw_pred)
+
             row: dict = {
                 "candidate": name,
                 "fold": fold,
@@ -1789,7 +1816,7 @@ def _run_uplift_cv_loop(
             }
             for frac in uplift_k_fracs:
                 key = f"uplift_at_k_{int(frac * 100)}"
-                row[key] = uplift_at_k(y_val, t_val, pred, frac)
+                row[key] = uplift_at_k(y_val, t_val, neg_pred, frac)
             results_ref.append(row)
 
 
@@ -1991,10 +2018,13 @@ def get_validation_uplift_curves(
             model = build_model(meta_key, base_key, scale_pos_weight)
             model.fit(X_tr, t_tr, y_tr)
             pred = model.predict(X_val)
-            pred = np.asarray(pred).ravel()
+            # Negate CATE for churn: higher = more beneficial treatment.
+            neg_pred = -np.asarray(pred).ravel()
             if pred_for_baseline is None:
-                pred_for_baseline = pred.copy()
-            ks, uplift_vals = uplift_curve(y_val, t_val, pred, n_points=n_curve_points)
+                pred_for_baseline = neg_pred.copy()
+            ks, uplift_vals = uplift_curve(
+                y_val, t_val, neg_pred, n_points=n_curve_points
+            )
             curves[name] = (ks, uplift_vals)
     rng = np.random.default_rng(random_state)
     random_pred = (
@@ -2021,7 +2051,7 @@ def plot_uplift_curves_comparison(
             continue
         ax.plot(ks[valid], vals[valid], label=label, linewidth=2)
     ax.set_xlabel("Fraction of population (sorted by predicted uplift)")
-    ax.set_ylabel("Cumulative uplift (churn rate difference)")
+    ax.set_ylabel("Churn rate difference")
     ax.set_title("Uplift curves on validation fold (top models vs random baseline)")
     ax.legend()
     ax.axhline(0, color="gray", linestyle="--")
