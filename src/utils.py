@@ -13,6 +13,8 @@ from typing import TYPE_CHECKING
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.stats import chi2_contingency
 from sklearn.metrics.pairwise import cosine_similarity
 
 try:
@@ -46,12 +48,21 @@ SIMILARITY_THRESHOLD: float = 0.2
 EMBED_MODEL_NAME: str = "all-MiniLM-L6-v2"
 FOCUS_ICD_CODES: list[str] = ["E11.9", "I10", "Z71.3"]
 RANDOM_STATE: int = 42
-DOW_NAMES: dict[int, str] = {0: "Mon", 1: "Tue", 2: "Wed", 3: "Thu", 4: "Fri", 5: "Sat", 6: "Sun"}
+DOW_NAMES: dict[int, str] = {
+    0: "Mon",
+    1: "Tue",
+    2: "Wed",
+    3: "Thu",
+    4: "Fri",
+    5: "Sat",
+    6: "Sun",
+}
 
 
 # ---------------------------------------------------------------------------
 # EDA helpers
 # ---------------------------------------------------------------------------
+
 
 def print_table_overview(name: str, df: pd.DataFrame) -> None:
     """Print structure, dtypes, numeric describe, date ranges, and head for a single table.
@@ -67,9 +78,9 @@ def print_table_overview(name: str, df: pd.DataFrame) -> None:
     -------
     None
     """
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"  {name}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     print("\n--- dtypes ---")
     print(df.dtypes.to_string())
 
@@ -92,6 +103,374 @@ def print_table_overview(name: str, df: pd.DataFrame) -> None:
             print(f"  {col}: {df[col].nunique()} unique values")
     print("\n--- head(2) ---")
     display(df.head(2))
+
+
+def missingness_and_member_coverage(
+    all_tables: dict[str, pd.DataFrame],
+    churn_labels: pd.DataFrame,
+    web_visits: pd.DataFrame,
+    app_usage: pd.DataFrame,
+    claims: pd.DataFrame,
+    test_members: pd.DataFrame,
+    test_web_visits: pd.DataFrame,
+    test_app_usage: pd.DataFrame,
+    test_claims: pd.DataFrame,
+    show_plot: bool = True,
+) -> None:
+    """Report column-level nulls and member coverage across activity sources (web, app, claims).
+
+    Part A: For each table in all_tables, report any column with nulls.
+    Part B: For TRAIN (churn_labels) and TEST (test_members), count members with zero rows
+    in each source; for TRAIN only, print cross-source missingness patterns and optionally
+    show a bar chart of % absent per source.
+
+    Parameters
+    ----------
+    all_tables : dict[str, pd.DataFrame]
+        Map of table name -> DataFrame (all 8 tables) for Part A null check.
+    churn_labels : pandas.DataFrame
+        Train base set (member_id); used as TRAIN base for Part B.
+    web_visits : pandas.DataFrame
+        Train web events (member_id).
+    app_usage : pandas.DataFrame
+        Train app events (member_id).
+    claims : pandas.DataFrame
+        Train claims (member_id).
+    test_members : pandas.DataFrame
+        Test base set (member_id); used as TEST base for Part B.
+    test_web_visits : pandas.DataFrame
+        Test web events (member_id).
+    test_app_usage : pandas.DataFrame
+        Test app events (member_id).
+    test_claims : pandas.DataFrame
+        Test claims (member_id).
+    show_plot : bool, optional
+        If True, show bar chart of % members absent per source for train (default True).
+
+    Returns
+    -------
+    None
+    """
+    # Part A: Column-level null check
+    print("=" * 60)
+    print("  Part A — Column-level null check")
+    print("=" * 60)
+
+    null_rows: list[dict] = []
+    for name, df in all_tables.items():
+        nulls = df.isnull().sum()
+        for col, cnt in nulls.items():
+            if cnt > 0:
+                null_rows.append({"table": name, "column": col, "null_count": int(cnt)})
+
+    if null_rows:
+        null_df = pd.DataFrame(null_rows)
+        print(null_df.to_string(index=False))
+    else:
+        print("\n✓ No null values found in any column of any table.\n")
+
+    # Part B: Member coverage across activity sources
+    print("=" * 60)
+    print("  Part B — Member coverage across sources")
+    print("=" * 60)
+
+    train_src = {"web_visits": web_visits, "app_usage": app_usage, "claims": claims}
+    test_src = {
+        "web_visits": test_web_visits,
+        "app_usage": test_app_usage,
+        "claims": test_claims,
+    }
+
+    for split_name, base_df, src_tables in [
+        ("TRAIN", churn_labels, train_src),
+        ("TEST", test_members, test_src),
+    ]:
+        base_ids = set(base_df["member_id"].unique())
+        n_base = len(base_ids)
+        print(f"\n--- {split_name} (base members: {n_base}) ---")
+
+        source_sets: dict[str, set] = {}
+        coverage_rows: list[dict] = []
+        for src_name, src_df in src_tables.items():
+            present = set(src_df["member_id"].unique())
+            source_sets[src_name] = present
+            missing = len(base_ids - present)
+            coverage_rows.append(
+                {
+                    "source": src_name,
+                    "members_present": len(present & base_ids),
+                    "members_absent": missing,
+                    "absent_pct": missing / n_base * 100,
+                }
+            )
+
+        cov = pd.DataFrame(coverage_rows)
+        print(cov.to_string(index=False))
+
+        # Cross-source pattern and bar chart (train only)
+        if split_name == "TRAIN":
+            has_web = source_sets["web_visits"] & base_ids
+            has_app = source_sets["app_usage"] & base_ids
+            has_claims = source_sets["claims"] & base_ids
+            no_web = base_ids - has_web
+            no_app = base_ids - has_app
+            no_claims = base_ids - has_claims
+
+            patterns = {
+                "missing web only": len(no_web - no_app - no_claims),
+                "missing app only": len(no_app - no_web - no_claims),
+                "missing claims only": len(no_claims - no_web - no_app),
+                "missing web+app": len(no_web & no_app - no_claims),
+                "missing web+claims": len(no_web & no_claims - no_app),
+                "missing app+claims": len(no_app & no_claims - no_web),
+                "missing all 3": len(no_web & no_app & no_claims),
+                "present in all": len(has_web & has_app & has_claims),
+            }
+            print("\nCross-source missingness patterns (train):")
+            for pat, cnt in patterns.items():
+                print(f"  {pat}: {cnt} ({cnt / n_base * 100:.2f}%)")
+
+            if show_plot:
+                fig, ax = plt.subplots(figsize=(7, 4))
+                bars = ax.bar(
+                    cov["source"], cov["absent_pct"], color=sns.color_palette()[:3]
+                )
+                ax.set_ylabel("% of members with zero activity")
+                ax.set_xlabel("Source table")
+                ax.set_title("Members absent from each activity source (train)")
+                for bar, row in zip(bars, cov.itertuples()):
+                    ax.annotate(
+                        f"{row.members_absent}\n({row.absent_pct:.2f}%)",
+                        xy=(bar.get_x() + bar.get_width() / 2, bar.get_height()),
+                        ha="center",
+                        va="bottom",
+                        fontsize=9,
+                    )
+                plt.tight_layout()
+                plt.show()
+
+
+def missingness_mechanism_analysis(
+    churn_labels: pd.DataFrame,
+    web_visits: pd.DataFrame,
+    app_usage: pd.DataFrame,
+    claims: pd.DataFrame,
+    show_plot: bool = True,
+) -> None:
+    """Assess whether absence from activity sources correlates with churn/outreach (MCAR vs MAR/MNAR).
+
+    Builds has_web / has_app / has_claims on the train base, runs Chi-square tests for
+    churn and outreach by presence/absence per source, prints cross-source contingency,
+    and optionally shows a grouped bar chart of churn rate (has activity vs no activity per source).
+
+    Parameters
+    ----------
+    churn_labels : pandas.DataFrame
+        Train labels with columns member_id, churn, outreach.
+    web_visits : pandas.DataFrame
+        Train web events (member_id).
+    app_usage : pandas.DataFrame
+        Train app events (member_id).
+    claims : pandas.DataFrame
+        Train claims (member_id).
+    show_plot : bool, optional
+        If True, show grouped bar chart of churn rate by source and presence (default True).
+
+    Returns
+    -------
+    None
+    """
+    # Build has_X flags on train base
+    train_ids = churn_labels[["member_id", "churn", "outreach"]].copy()
+    web_ids = set(web_visits["member_id"].unique())
+    app_ids = set(app_usage["member_id"].unique())
+    claims_ids = set(claims["member_id"].unique())
+    train_ids["has_web"] = train_ids["member_id"].isin(web_ids).astype(int)
+    train_ids["has_app"] = train_ids["member_id"].isin(app_ids).astype(int)
+    train_ids["has_claims"] = train_ids["member_id"].isin(claims_ids).astype(int)
+
+    # Chi-square tests: churn and outreach rate by presence/absence per source
+    results: list[dict] = []
+    for source in ["has_web", "has_app", "has_claims"]:
+        for target in ["churn", "outreach"]:
+            ct = pd.crosstab(train_ids[source], train_ids[target])
+            chi2, p, dof, expected = chi2_contingency(ct)
+            rate_absent = train_ids.loc[train_ids[source] == 0, target].mean()
+            rate_present = train_ids.loc[train_ids[source] == 1, target].mean()
+            results.append(
+                {
+                    "source_flag": source,
+                    "target": target,
+                    "rate_absent (0)": round(rate_absent, 4)
+                    if pd.notna(rate_absent)
+                    else "N/A",
+                    "rate_present (1)": round(rate_present, 4),
+                    "chi2": round(chi2, 2),
+                    "p_value": f"{p:.4g}",
+                }
+            )
+
+    results_df = pd.DataFrame(results)
+    print("=" * 70)
+    print("  Chi-square tests: churn/outreach rate by presence/absence")
+    print("=" * 70)
+    print(results_df.to_string(index=False))
+
+    # Cross-source contingency (train)
+    print("\n" + "=" * 70)
+    print("  Cross-source contingency (train)")
+    print("=" * 70)
+    cross = (
+        train_ids.groupby(["has_web", "has_app", "has_claims"])
+        .size()
+        .reset_index(name="count")
+    )
+    print(cross.to_string(index=False))
+
+    # Grouped bar chart: churn rate present vs absent per source
+    if not show_plot:
+        return
+
+    chart_data: list[dict] = []
+    for source in ["has_web", "has_app", "has_claims"]:
+        for val, label in [(1, "present"), (0, "absent")]:
+            subset = train_ids[train_ids[source] == val]
+            if len(subset) > 0:
+                chart_data.append(
+                    {
+                        "source": source.replace("has_", ""),
+                        "group": label,
+                        "churn_rate": subset["churn"].mean(),
+                        "n": len(subset),
+                    }
+                )
+
+    chart_df = pd.DataFrame(chart_data)
+    if len(chart_df) == 0:
+        return
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    sources = chart_df["source"].unique()
+    x = np.arange(len(sources))
+    width = 0.35
+    present = chart_df[chart_df["group"] == "present"].set_index("source")
+    absent = chart_df[chart_df["group"] == "absent"].set_index("source")
+    bars1 = ax.bar(
+        x - width / 2,
+        [present.loc[s, "churn_rate"] if s in present.index else 0 for s in sources],
+        width,
+        label="Has activity",
+        color=sns.color_palette()[0],
+    )
+    bars2 = ax.bar(
+        x + width / 2,
+        [absent.loc[s, "churn_rate"] if s in absent.index else 0 for s in sources],
+        width,
+        label="No activity",
+        color=sns.color_palette()[3],
+    )
+    ax.set_ylabel("Churn rate")
+    ax.set_xlabel("Activity source")
+    ax.set_title("Churn rate: members with vs without activity per source")
+    ax.set_xticks(x)
+    ax.set_xticklabels(sources)
+    ax.legend()
+    for bars in [bars1, bars2]:
+        for bar in bars:
+            h = bar.get_height()
+            if h > 0:
+                ax.annotate(
+                    f"{h:.3f}",
+                    xy=(bar.get_x() + bar.get_width() / 2, h),
+                    ha="center",
+                    va="bottom",
+                    fontsize=9,
+                )
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_balance(
+    data: pd.DataFrame,
+    x: str,
+    title: str,
+    xlabel: str,
+    ylabel: str = "Count",
+    y: str | None = None,
+    figsize: tuple[int, int] = (8, 5),
+) -> None:
+    """Draw a single balance plot: countplot (if y is None) or barplot (if y is set).
+
+    Used for labels/treatment balance: outreach counts, churn counts, or churn rate by group.
+    Same styling (title, axis labels, figsize, tight_layout) for consistency.
+
+    Parameters
+    ----------
+    data : pandas.DataFrame
+        Data to plot (e.g. churn_labels or summary_labels.reset_index()).
+    x : str
+        Column name for the x-axis (e.g. 'outreach', 'churn').
+    title : str
+        Plot title.
+    xlabel : str
+        X-axis label.
+    ylabel : str, optional
+        Y-axis label (default 'Count'). Use e.g. 'Churn rate' for barplot.
+    y : str or None, optional
+        If None, use sns.countplot(data, x=x). If set, use sns.barplot(data, x=x, y=y).
+    figsize : tuple of (int, int), optional
+        Figure size (default (8, 5)).
+
+    Returns
+    -------
+    None
+    """
+    plt.figure(figsize=figsize)
+    if y is None:
+        sns.countplot(data=data, x=x)
+    else:
+        sns.barplot(data=data, x=x, y=y)
+    plt.title(title, fontsize=14, fontweight="bold")
+    plt.xlabel(xlabel, fontsize=12)
+    plt.ylabel(ylabel, fontsize=12)
+    plt.tick_params(labelsize=11)
+    plt.tight_layout()
+    plt.show()
+
+
+def engagement_feat_summary(
+    eng: pd.DataFrame,
+    feat: str,
+    bins: int = 50,
+) -> None:
+    """Print quantile summary and show a log-scaled histogram for one engagement feature.
+
+    Used for distribution sanity checks: call once per feature (e.g. web_visits_count,
+    app_sessions_count, url_nunique). Plots log(1 + values) to handle skew.
+
+    Parameters
+    ----------
+    eng : pandas.DataFrame
+        Engagement dataframe with at least the column named by feat (zero-filled).
+    feat : str
+        Column name to summarize and plot (e.g. 'web_visits_count', 'app_sessions_count', 'url_nunique').
+    bins : int, optional
+        Number of histogram bins (default 50).
+
+    Returns
+    -------
+    None
+    """
+    print(f"\n{feat}:")
+    print(eng[feat].quantile([0, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99, 1]).to_string())
+    fig, ax = plt.subplots(figsize=(5, 4))
+    ax.hist(np.log1p(eng[feat]), bins=bins, edgecolor="black", alpha=0.7)
+    ax.set_xlabel(f"log(1 + {feat})", fontsize=11)
+    ax.set_ylabel("Number of members", fontsize=11)
+    ax.set_title(feat, fontsize=12, fontweight="bold")
+    ax.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.show()
 
 
 def count_events_before_signup(
@@ -143,7 +522,9 @@ def time_bin(h: int) -> str:
     return "Evening"
 
 
-def compute_uplift(labels_df: pd.DataFrame, member_ids: pd.Series | np.ndarray) -> tuple[float, int, int]:
+def compute_uplift(
+    labels_df: pd.DataFrame, member_ids: pd.Series | np.ndarray
+) -> tuple[float, int, int]:
     """Return (uplift, n_treated, n_control) for a set of member IDs.
 
     Parameters
@@ -189,7 +570,9 @@ def plot_uplift_bars(
     None
     """
     fig, ax = plt.subplots(figsize=(8, 4))
-    ax.bar(range(len(bin_names)), uplifts, color="steelblue", edgecolor="black", alpha=0.85)
+    ax.bar(
+        range(len(bin_names)), uplifts, color="steelblue", edgecolor="black", alpha=0.85
+    )
     ax.axhline(0, color="black", linestyle="--", linewidth=1)
     ax.set_xticks(range(len(bin_names)))
     ax.set_xticklabels(bin_names, rotation=20, ha="right")
@@ -199,6 +582,61 @@ def plot_uplift_bars(
     ax.grid(axis="y", alpha=0.3)
     plt.tight_layout()
     plt.show()
+
+
+def uplift_by_groups(
+    events: pd.DataFrame,
+    labels_df: pd.DataFrame,
+    group_col: str,
+    group_values: list,
+    plot_labels: list[str] | None = None,
+    title: str = "",
+    xlabel: str = "",
+) -> None:
+    """Compute uplift per group, plot bars, and print a summary table.
+
+    For each value in group_values, filters events by group_col == value, gets member IDs,
+    computes uplift via compute_uplift(labels_df, ids), then plots all uplifts and prints
+    a table (Group, Uplift, n_treated, n_control). Use for time-of-day, day-of-week,
+    weekend vs weekday, or any other categorical split.
+
+    Parameters
+    ----------
+    events : pandas.DataFrame
+        Event table with member_id and the column named by group_col.
+    labels_df : pandas.DataFrame
+        Labels with member_id, churn, outreach (e.g. churn_labels or subset).
+    group_col : str
+        Column in events to filter on (e.g. 'time_of_day', 'dow_name', 'is_weekend').
+    group_values : list
+        Ordered list of values to iterate over (e.g. tod_order, dow_order, [False, True]).
+    plot_labels : list of str or None, optional
+        Labels for plot and table. If None, use str(v) for each value in group_values.
+    title : str, optional
+        Plot title.
+    xlabel : str, optional
+        X-axis label.
+
+    Returns
+    -------
+    None
+    """
+    display_labels = (
+        plot_labels if plot_labels is not None else [str(v) for v in group_values]
+    )
+    uplifts: list[float] = []
+    n_ts: list[int] = []
+    n_cs: list[int] = []
+    for val in group_values:
+        ids = events.loc[events[group_col] == val, "member_id"].unique()
+        u, nt, nc = compute_uplift(labels_df, ids)
+        uplifts.append(u)
+        n_ts.append(nt)
+        n_cs.append(nc)
+    plot_uplift_bars(display_labels, uplifts, title=title, xlabel=xlabel)
+    print(f"{'Group':<25} {'Uplift':>8} {'n_treated':>10} {'n_control':>10}")
+    for name, u, nt, nc in zip(display_labels, uplifts, n_ts, n_cs):
+        print(f"{name:<25} {u:>8.4f} {nt:>10} {nc:>10}")
 
 
 def build_recency_tenure(
@@ -234,16 +672,28 @@ def build_recency_tenure(
     last_claim = claims_df.groupby("member_id")["diagnosis_date"].max()
 
     out = members_df[["member_id", "signup_date"]].copy()
-    out["days_since_last_web"] = out["member_id"].map(last_web).pipe(lambda s: (ref_date - s).dt.days)
-    out["days_since_last_app"] = out["member_id"].map(last_app).pipe(lambda s: (ref_date - s).dt.days)
-    out["days_since_last_claim"] = out["member_id"].map(last_claim).pipe(lambda s: (ref_date - s).dt.days)
+    out["days_since_last_web"] = (
+        out["member_id"].map(last_web).pipe(lambda s: (ref_date - s).dt.days)
+    )
+    out["days_since_last_app"] = (
+        out["member_id"].map(last_app).pipe(lambda s: (ref_date - s).dt.days)
+    )
+    out["days_since_last_claim"] = (
+        out["member_id"].map(last_claim).pipe(lambda s: (ref_date - s).dt.days)
+    )
     last_any = (
-        pd.concat([last_web.rename("ts"), last_app.rename("ts"), last_claim.rename("ts")])
+        pd.concat(
+            [last_web.rename("ts"), last_app.rename("ts"), last_claim.rename("ts")]
+        )
         .groupby(level=0)
         .max()
     )
-    out["days_since_last_activity"] = out["member_id"].map(last_any).pipe(lambda s: (ref_date - s).dt.days)
-    out["tenure_days"] = (ref_date - pd.to_datetime(out["signup_date"], errors="coerce")).dt.days
+    out["days_since_last_activity"] = (
+        out["member_id"].map(last_any).pipe(lambda s: (ref_date - s).dt.days)
+    )
+    out["tenure_days"] = (
+        ref_date - pd.to_datetime(out["signup_date"], errors="coerce")
+    ).dt.days
     out["recent_any_7d"] = (
         out["days_since_last_activity"].notna() & (out["days_since_last_activity"] <= 7)
     ).astype(int)
@@ -254,6 +704,7 @@ def build_recency_tenure(
 # ---------------------------------------------------------------------------
 # Feature engineering pipeline
 # ---------------------------------------------------------------------------
+
 
 def load_wellco_brief(path: Path | str) -> str:
     """Read the WellCo client brief from disk and return it as a single string.
@@ -291,7 +742,9 @@ def ref_date_from_tables(*dfs: pd.DataFrame) -> pd.Timestamp:
         if "diagnosis_date" in df.columns:
             max_dates.append(df["diagnosis_date"].max())
     if not max_dates:
-        raise ValueError("None of the supplied DataFrames contain 'timestamp' or 'diagnosis_date'.")
+        raise ValueError(
+            "None of the supplied DataFrames contain 'timestamp' or 'diagnosis_date'."
+        )
     return max(max_dates)
 
 
@@ -412,7 +865,9 @@ def agg_web_features(
     agg["days_since_last_wellco_web"] = (ref_date - agg["_last_visit"]).dt.days
     agg.drop(columns="_last_visit", inplace=True)
     out = members_df[["member_id"]].merge(agg, on="member_id", how="left")
-    out["wellco_web_visits_count"] = out["wellco_web_visits_count"].fillna(0).astype(int)
+    out["wellco_web_visits_count"] = (
+        out["wellco_web_visits_count"].fillna(0).astype(int)
+    )
     return out
 
 
@@ -476,7 +931,9 @@ def agg_claims_features(
     return out
 
 
-def agg_lifecycle_tenure(members_df: pd.DataFrame, ref_date: pd.Timestamp) -> pd.DataFrame:
+def agg_lifecycle_tenure(
+    members_df: pd.DataFrame, ref_date: pd.Timestamp
+) -> pd.DataFrame:
     """Compute membership tenure in days as of the reference date.
 
     Returns
@@ -560,6 +1017,7 @@ def build_feature_matrix(
 # ---------------------------------------------------------------------------
 # Model and metric helpers
 # ---------------------------------------------------------------------------
+
 
 def make_lgbm():
     """Create a LightGBM regressor configured for shallow, regularised trees."""
