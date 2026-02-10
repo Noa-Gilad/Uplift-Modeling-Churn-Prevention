@@ -10,6 +10,7 @@ e.g. files/train/, files/test/, files/wellco_client_brief.txt.
 
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -21,9 +22,13 @@ from scipy.stats import chi2_contingency
 from sklearn.metrics.pairwise import cosine_similarity
 
 try:
-    from causalml.inference.meta import BaseSRegressor, BaseTRegressor, BaseXRegressor
+    from causalml.inference.meta import BaseSRegressor, BaseTRegressor
 except Exception:
-    BaseSRegressor = BaseTRegressor = BaseXRegressor = None  # type: ignore[misc, assignment]
+    BaseSRegressor = BaseTRegressor = None  # type: ignore[misc, assignment]
+try:
+    from causalml.metrics import qini_auc_score as causalml_qini_auc
+except Exception:
+    causalml_qini_auc = None  # type: ignore[misc, assignment]
 try:
     from lightgbm import LGBMRegressor
     from xgboost import XGBRegressor
@@ -1613,7 +1618,7 @@ def build_model(meta_key: str, base_key: str, spw: float):
     Parameters
     ----------
     meta_key : str
-        One of 'S', 'T', 'X'.
+        One of 'S', 'T'.
     base_key : str
         One of 'LGBM', 'XGB'.
     spw : float
@@ -1623,8 +1628,474 @@ def build_model(meta_key: str, base_key: str, spw: float):
     -------
     CausalML meta-learner instance.
     """
-    if BaseSRegressor is None or BaseTRegressor is None or BaseXRegressor is None:
+    if BaseSRegressor is None or BaseTRegressor is None:
         raise ImportError("causalml is not installed")
     learner = make_lgbm() if base_key == "LGBM" else make_xgb(spw)
-    meta_map = {"S": BaseSRegressor, "T": BaseTRegressor, "X": BaseXRegressor}
+    meta_map = {"S": BaseSRegressor, "T": BaseTRegressor}
     return meta_map[meta_key](learner=learner)
+
+
+# ---------------------------------------------------------------------------
+# Uplift CV and model comparison (Section 5)
+# ---------------------------------------------------------------------------
+
+
+def qini_coefficient(
+    y_true: np.ndarray,
+    treatment: np.ndarray,
+    uplift_scores: np.ndarray,
+) -> float:
+    """Compute Qini coefficient (normalized area under Qini curve) when causalml is available.
+
+    Parameters
+    ----------
+    y_true : np.ndarray
+        Binary outcome (e.g. churn 0/1).
+    treatment : np.ndarray
+        Treatment indicator (1 = treated, 0 = control).
+    uplift_scores : np.ndarray
+        Predicted uplift per sample.
+
+    Returns
+    -------
+    float
+        Qini coefficient, or np.nan if causalml.metrics is not available.
+    """
+    if causalml_qini_auc is None:
+        return np.nan
+    try:
+        return float(causalml_qini_auc(y_true, uplift_scores, treatment))
+    except Exception:
+        return np.nan
+
+
+def run_uplift_cv(
+    X: pd.DataFrame,
+    y: np.ndarray,
+    treatment: np.ndarray,
+    candidate_defs: list[tuple[str, str, str]],
+    n_splits: int = 5,
+    random_state: int = RANDOM_STATE,
+    scale_pos_weight: float = 1.0,
+    n_curve_points: int = 100,
+    uplift_k_fracs: list[float] | None = None,
+) -> list[dict]:
+    """Run stratified K-fold CV for each uplift candidate; return per-fold metrics.
+
+    Stratification is by 2*treatment + y so treatment/control and outcome balance
+    are preserved. For each fold and candidate: fit on train, predict on val,
+    compute AUUC, Qini, uplift@k. Records n_val, n_treated_val, n_control_val per fold.
+
+    Parameters
+    ----------
+    X : pd.DataFrame
+        Feature matrix (numeric).
+    y : np.ndarray
+        Binary outcome (e.g. churn 0/1).
+    treatment : np.ndarray
+        Treatment indicator (1 = treated, 0 = control).
+    candidate_defs : list of (name, meta_key, base_key)
+        e.g. [('S+LGBM','S','LGBM'), ('T+XGB','T','XGB')].
+    n_splits : int
+        Number of CV folds.
+    random_state : int
+        For StratifiedKFold.
+    scale_pos_weight : float
+        Passed to XGB base learner (ignored for LGBM).
+    n_curve_points : int
+        Points for uplift curve (AUUC).
+    uplift_k_fracs : list of float or None
+        Fractions for uplift@k. Default [0.05, 0.1, 0.2].
+
+    Returns
+    -------
+    list of dict
+        Each dict: candidate, fold, auuc, qini, uplift_at_k_*, n_val, n_treated_val, n_control_val.
+    """
+    from sklearn.model_selection import StratifiedKFold
+
+    if uplift_k_fracs is None:
+        uplift_k_fracs = [0.05, 0.1, 0.2]
+    results: list[dict] = []
+    # CausalML converts X to numpy before calling the base learner; sklearn then warns "X does not have valid
+    # feature names" at predict. Suppress that specific warning so output is clean.
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="X does not have valid feature names",
+            category=UserWarning,
+            module="sklearn.utils.validation",
+        )
+        _run_uplift_cv_loop(
+            X=X,
+            y=y,
+            treatment=treatment,
+            candidate_defs=candidate_defs,
+            n_splits=n_splits,
+            random_state=random_state,
+            scale_pos_weight=scale_pos_weight,
+            uplift_k_fracs=uplift_k_fracs,
+            n_curve_points=n_curve_points,
+            results_ref=results,
+        )
+    return results
+
+
+def _run_uplift_cv_loop(
+    X,
+    y,
+    treatment,
+    candidate_defs,
+    n_splits,
+    random_state,
+    scale_pos_weight,
+    uplift_k_fracs,
+    n_curve_points,
+    results_ref: list,
+) -> None:
+    """Inner loop of run_uplift_cv (fit/predict per candidate per fold). Called with warning filter active."""
+    from sklearn.model_selection import StratifiedKFold
+
+    if uplift_k_fracs is None:
+        uplift_k_fracs = [0.05, 0.1, 0.2]
+    X_df = X if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
+    stratify = 2 * treatment + y
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    for name, meta_key, base_key in candidate_defs:
+        for fold, (train_idx, val_idx) in enumerate(skf.split(X_df, stratify)):
+            X_tr = X_df.iloc[train_idx]
+            X_val = X_df.iloc[val_idx]
+            y_tr, y_val = y[train_idx], y[val_idx]
+            t_tr, t_val = treatment[train_idx], treatment[val_idx]
+            n_val = len(val_idx)
+            n_treated_val = int((t_val == 1).sum())
+            n_control_val = int((t_val == 0).sum())
+            model = build_model(meta_key, base_key, scale_pos_weight)
+            model.fit(X_tr, t_tr, y_tr)
+            pred = model.predict(X_val)
+            # CausalML predict returns (n_samples, n_treatment_groups); flatten to 1D for uplift_curve and metrics.
+            pred = np.asarray(pred).ravel()
+            ks, uplift_vals = uplift_curve(y_val, t_val, pred, n_points=n_curve_points)
+            auuc = approx_auuc(ks, uplift_vals)
+            qini = qini_coefficient(y_val, t_val, pred)
+            row: dict = {
+                "candidate": name,
+                "fold": fold,
+                "auuc": auuc,
+                "qini": qini,
+                "n_val": n_val,
+                "n_treated_val": n_treated_val,
+                "n_control_val": n_control_val,
+            }
+            for frac in uplift_k_fracs:
+                key = f"uplift_at_k_{int(frac * 100)}"
+                row[key] = uplift_at_k(y_val, t_val, pred, frac)
+            results_ref.append(row)
+
+
+def summarize_uplift_cv(
+    cv_results: list[dict],
+    metric_cols: list[str] | None = None,
+) -> pd.DataFrame:
+    """Aggregate per-candidate CV metrics (mean and std).
+
+    Parameters
+    ----------
+    cv_results : list of dict
+        Output from run_uplift_cv.
+    metric_cols : list of str or None
+        Columns to aggregate. Default: auuc, qini, uplift_at_k_5, uplift_at_k_10, uplift_at_k_20.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per candidate; columns candidate, and for each metric: mean, std.
+    """
+    if metric_cols is None:
+        metric_cols = [
+            "auuc",
+            "qini",
+            "uplift_at_k_5",
+            "uplift_at_k_10",
+            "uplift_at_k_20",
+        ]
+    df = pd.DataFrame(cv_results)
+    present = [m for m in metric_cols if m in df.columns]
+    agg_dict: dict = {}
+    for m in present:
+        agg_dict[f"{m}_mean"] = (m, "mean")
+        agg_dict[f"{m}_std"] = (m, "std")
+    if not agg_dict:
+        return df.groupby("candidate").first().reset_index()
+    return df.groupby("candidate").agg(**agg_dict).reset_index()
+
+
+def build_uplift_cv_comparison_table(
+    cv_results: list[dict],
+    metric_cols: list[str] | None = None,
+) -> pd.DataFrame:
+    """Build comparison table: mean±std per candidate and fold sanity (n_val, n_treated_val, n_control_val).
+
+    Parameters
+    ----------
+    cv_results : list of dict
+        Output from run_uplift_cv.
+    metric_cols : list of str or None
+        Default: auuc, qini, uplift_at_k_5, uplift_at_k_10, uplift_at_k_20.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per candidate; metric mean/std plus n_val_mean, n_treated_val_mean, n_control_val_mean.
+    """
+    if metric_cols is None:
+        metric_cols = [
+            "auuc",
+            "qini",
+            "uplift_at_k_5",
+            "uplift_at_k_10",
+            "uplift_at_k_20",
+        ]
+    df = pd.DataFrame(cv_results)
+    present = [m for m in metric_cols if m in df.columns]
+    agg_dict: dict = {}
+    for m in present:
+        agg_dict[f"{m}_mean"] = (m, "mean")
+        agg_dict[f"{m}_std"] = (m, "std")
+    for col in ["n_val", "n_treated_val", "n_control_val"]:
+        if col in df.columns:
+            agg_dict[f"{col}_mean"] = (col, "mean")
+    if not agg_dict:
+        return df.groupby("candidate").first().reset_index()
+    return df.groupby("candidate").agg(**agg_dict).reset_index()
+
+
+def plot_auuc_comparison(
+    cv_summary: pd.DataFrame,
+    ax: plt.Axes | None = None,
+    save_path: str | Path | None = None,
+) -> plt.Axes:
+    """Bar plot of mean AUUC with error bars (std) across models."""
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(10, 5))
+    names = cv_summary["candidate"].astype(str)
+    means = cv_summary["auuc_mean"].values
+    stds = (
+        cv_summary["auuc_std"].values
+        if "auuc_std" in cv_summary.columns
+        else np.zeros_like(means)
+    )
+    x = np.arange(len(names))
+    ax.bar(x, means, yerr=stds, capsize=4, edgecolor="black", alpha=0.85)
+    ax.set_xticks(x)
+    ax.set_xticklabels(names, rotation=45, ha="right")
+    ax.set_ylabel("AUUC (mean ± std)")
+    ax.set_title("Uplift model comparison: AUUC")
+    set_axes_clear(ax, x_axis_at_zero=False)
+    plt.tight_layout()
+    if save_path is not None:
+        plt.savefig(Path(save_path), bbox_inches="tight", dpi=150)
+    return ax
+
+
+def plot_uplift_at_k_comparison(
+    cv_summary: pd.DataFrame,
+    k_fracs: list[float] | None = None,
+    ax: plt.Axes | None = None,
+    save_path: str | Path | None = None,
+) -> plt.Axes:
+    """Bar plot of mean uplift@k (and std) for k=10% and 20% (and optionally 5%) across models."""
+    if k_fracs is None:
+        k_fracs = [0.1, 0.2]
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(10, 5))
+    names = cv_summary["candidate"].astype(str)
+    x = np.arange(len(names))
+    width = 0.8 / len(k_fracs)
+    for i, frac in enumerate(k_fracs):
+        key = f"uplift_at_k_{int(frac * 100)}"
+        mean_col = f"{key}_mean"
+        std_col = f"{key}_std"
+        if mean_col not in cv_summary.columns:
+            continue
+        means = cv_summary[mean_col].values
+        stds = (
+            cv_summary[std_col].values
+            if std_col in cv_summary.columns
+            else np.zeros_like(means)
+        )
+        offset = (i - len(k_fracs) / 2 + 0.5) * width
+        ax.bar(
+            x + offset,
+            means,
+            width,
+            yerr=stds,
+            capsize=2,
+            label=f"uplift@{int(frac * 100)}%",
+        )
+    ax.set_xticks(x)
+    ax.set_xticklabels(names, rotation=45, ha="right")
+    ax.set_ylabel("Uplift (churn rate difference)")
+    ax.set_title("Uplift model comparison: uplift@k")
+    ax.legend()
+    ax.axhline(0, color="black", linewidth=0.8)
+    set_axes_clear(ax, x_axis_at_zero=False)
+    plt.tight_layout()
+    if save_path is not None:
+        plt.savefig(Path(save_path), bbox_inches="tight", dpi=150)
+    return ax
+
+
+def get_validation_uplift_curves(
+    X: pd.DataFrame,
+    y: np.ndarray,
+    treatment: np.ndarray,
+    candidate_defs: list[tuple[str, str, str]],
+    cv_summary: pd.DataFrame,
+    top_n: int = 3,
+    fold: int = 0,
+    n_splits: int = 5,
+    random_state: int = RANDOM_STATE,
+    scale_pos_weight: float = 1.0,
+    n_curve_points: int = 100,
+) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    """Get uplift curves (ks, uplift_vals) on one validation fold for top_n models and random baseline."""
+    from sklearn.model_selection import StratifiedKFold
+
+    stratify = 2 * treatment + y
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    splits = list(skf.split(X, stratify))
+    if fold >= len(splits):
+        fold = 0
+    train_idx, val_idx = splits[fold]
+    X_val = X.iloc[val_idx]
+    y_val = y[val_idx]
+    t_val = treatment[val_idx]
+    order = cv_summary.sort_values("auuc_mean", ascending=False)["candidate"].tolist()
+    defs_by_name = {c[0]: (c[1], c[2]) for c in candidate_defs}
+    curves: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    pred_for_baseline: np.ndarray | None = None
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="X does not have valid feature names",
+            category=UserWarning,
+            module="sklearn.utils.validation",
+        )
+        for name in order[:top_n]:
+            if name not in defs_by_name:
+                continue
+            meta_key, base_key = defs_by_name[name]
+            X_tr, y_tr = X.iloc[train_idx], y[train_idx]
+            t_tr = treatment[train_idx]
+            model = build_model(meta_key, base_key, scale_pos_weight)
+            model.fit(X_tr, t_tr, y_tr)
+            pred = model.predict(X_val)
+            pred = np.asarray(pred).ravel()
+            if pred_for_baseline is None:
+                pred_for_baseline = pred.copy()
+            ks, uplift_vals = uplift_curve(y_val, t_val, pred, n_points=n_curve_points)
+            curves[name] = (ks, uplift_vals)
+    rng = np.random.default_rng(random_state)
+    random_pred = (
+        rng.permutation(pred_for_baseline)
+        if pred_for_baseline is not None
+        else rng.random(len(y_val))
+    )
+    ks, random_vals = uplift_curve(y_val, t_val, random_pred, n_points=n_curve_points)
+    curves["Random baseline"] = (ks, random_vals)
+    return curves
+
+
+def plot_uplift_curves_comparison(
+    curves: dict[str, tuple[np.ndarray, np.ndarray]],
+    ax: plt.Axes | None = None,
+    save_path: str | Path | None = None,
+) -> plt.Axes:
+    """Overlay uplift curves with legend (for write-up)."""
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(8, 5))
+    for label, (ks, vals) in curves.items():
+        valid = ~np.isnan(vals)
+        if valid.sum() < 2:
+            continue
+        ax.plot(ks[valid], vals[valid], label=label, linewidth=2)
+    ax.set_xlabel("Fraction of population (sorted by predicted uplift)")
+    ax.set_ylabel("Cumulative uplift (churn rate difference)")
+    ax.set_title("Uplift curves on validation fold (top models vs random baseline)")
+    ax.legend()
+    ax.axhline(0, color="gray", linestyle="--")
+    set_axes_clear(ax, x_axis_at_zero=False)
+    plt.tight_layout()
+    if save_path is not None:
+        plt.savefig(Path(save_path), bbox_inches="tight", dpi=150)
+    return ax
+
+
+def save_uplift_cv_report(
+    cv_summary: pd.DataFrame,
+    table_path: str | Path,
+    figure_dir: str | Path,
+    cv_results: list[dict] | None = None,
+    X: pd.DataFrame | None = None,
+    y: np.ndarray | None = None,
+    treatment: np.ndarray | None = None,
+    candidate_defs: list[tuple[str, str, str]] | None = None,
+    top_n_curves: int = 3,
+    n_splits: int = 5,
+    random_state: int = RANDOM_STATE,
+    scale_pos_weight: float = 1.0,
+) -> None:
+    """Save comparison table (CSV) and figures (AUUC bar, uplift@k bar, curves) to disk."""
+    Path(table_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(figure_dir).mkdir(parents=True, exist_ok=True)
+    cv_summary.to_csv(table_path, index=False)
+    fig1, ax1 = plt.subplots(figsize=(10, 5))
+    plot_auuc_comparison(
+        cv_summary, ax=ax1, save_path=Path(figure_dir) / "auuc_comparison.png"
+    )
+    plt.close(fig1)
+    fig2, ax2 = plt.subplots(figsize=(10, 5))
+    plot_uplift_at_k_comparison(
+        cv_summary, ax=ax2, save_path=Path(figure_dir) / "uplift_at_k_comparison.png"
+    )
+    plt.close(fig2)
+    if (
+        X is not None
+        and y is not None
+        and treatment is not None
+        and candidate_defs is not None
+    ):
+        curves = get_validation_uplift_curves(
+            X,
+            y,
+            treatment,
+            candidate_defs,
+            cv_summary,
+            top_n=top_n_curves,
+            fold=0,
+            n_splits=n_splits,
+            random_state=random_state,
+            scale_pos_weight=scale_pos_weight,
+        )
+        fig3, ax3 = plt.subplots(figsize=(8, 5))
+        plot_uplift_curves_comparison(
+            curves, ax=ax3, save_path=Path(figure_dir) / "uplift_curves_comparison.png"
+        )
+        plt.close(fig3)
+
+
+def select_best_uplift_model(
+    cv_summary: pd.DataFrame,
+    metric: str = "auuc",
+    higher_is_better: bool = True,
+) -> str:
+    """Return the best candidate name by a given metric (e.g. auuc_mean). Optional; no auto-selection in Section 5."""
+    mean_col = f"{metric}_mean" if f"{metric}_mean" in cv_summary.columns else metric
+    if mean_col not in cv_summary.columns:
+        raise ValueError(f"Metric column {mean_col} not in cv_summary")
+    if higher_is_better:
+        best_idx = cv_summary[mean_col].idxmax()
+    else:
+        best_idx = cv_summary[mean_col].idxmin()
+    return str(cv_summary.loc[best_idx, "candidate"])
