@@ -27,8 +27,10 @@ except Exception:
     BaseSRegressor = BaseTRegressor = None  # type: ignore[misc, assignment]
 try:
     from causalml.metrics import qini_score as causalml_qini_score
+    from causalml.metrics import get_qini as causalml_get_qini
 except Exception:
     causalml_qini_score = None  # type: ignore[misc, assignment]
+    causalml_get_qini = None  # type: ignore[misc, assignment]
 try:
     from lightgbm import LGBMRegressor
     from xgboost import XGBRegressor
@@ -1597,8 +1599,17 @@ def assign_segments(uplift_scores: np.ndarray) -> np.ndarray:
     return seg
 
 
-def build_model(meta_key: str, base_key: str, spw: float):
+def build_model(
+    meta_key: str,
+    base_key: str,
+    spw: float,
+    base_params: dict | None = None,
+):
     """Instantiate a CausalML meta-learner with the requested base learner.
+
+    When *base_params* is None, uses default base learners (make_lgbm / make_xgb).
+    When *base_params* is a dict (e.g. from grid search), builds the base learner
+    with those keyword arguments plus fixed random_state / scale_pos_weight.
 
     Parameters
     ----------
@@ -1608,6 +1619,9 @@ def build_model(meta_key: str, base_key: str, spw: float):
         One of 'LGBM', 'XGB'.
     spw : float
         scale_pos_weight for XGBoost (ignored for LGBM).
+    base_params : dict | None
+        Optional extra kwargs for the base learner (max_depth, learning_rate, etc.).
+        If None, defaults are used.
 
     Returns
     -------
@@ -1615,7 +1629,26 @@ def build_model(meta_key: str, base_key: str, spw: float):
     """
     if BaseSRegressor is None or BaseTRegressor is None:
         raise ImportError("causalml is not installed")
-    learner = make_lgbm() if base_key == "LGBM" else make_xgb(spw)
+
+    if base_params is None:
+        learner = make_lgbm() if base_key == "LGBM" else make_xgb(spw)
+    else:
+        if base_key == "LGBM":
+            if LGBMRegressor is None:
+                raise ImportError("lightgbm is not installed")
+            learner = LGBMRegressor(random_state=RANDOM_STATE, verbose=-1, **base_params)
+        elif base_key == "XGB":
+            if XGBRegressor is None:
+                raise ImportError("xgboost is not installed")
+            learner = XGBRegressor(
+                random_state=RANDOM_STATE,
+                scale_pos_weight=spw,
+                verbosity=0,
+                **base_params,
+            )
+        else:
+            raise ValueError(f"Unknown base_key: {base_key}")
+
     meta_map = {"S": BaseSRegressor, "T": BaseTRegressor}
     return meta_map[meta_key](learner=learner)
 
@@ -1633,20 +1666,26 @@ def qini_coefficient(
     """Compute Qini coefficient (normalised area between model and random Qini curves).
 
     Delegates to CausalML's ``qini_score``, which internally sorts by
-    descending ``uplift_scores`` and computes a Qini curve using
-    ``treated_outcome − control_outcome``.  Callers should pass the **raw**
-    CATE (not negated) so that CausalML's ranking is consistent with its
-    internal formula.  A positive Qini means the model correctly
-    discriminates individuals by their treatment effect.
+    descending ``uplift_scores`` and computes
+    ``treated_positive − control_positive × (N_T / N_C)``.
+    For the coefficient to be positive when the model is good, ``y_true=1``
+    must represent the **desirable** outcome and higher ``uplift_scores``
+    must correspond to individuals who benefit most from treatment.
+
+    **Churn convention:** callers should pass ``1 − y`` (retention) and
+    ``-CATE`` (negated churn CATE = retention CATE) so that retained (Y=1)
+    is "good" and persuadables (positive retention uplift) rank first.
 
     Parameters
     ----------
     y_true : np.ndarray
-        Binary outcome (e.g. churn 0/1).
+        Binary outcome where Y=1 is the **desirable** outcome
+        (for churn tasks, pass ``1 - churn`` = retention).
     treatment : np.ndarray
         Treatment indicator (1 = treated, 0 = control).
     uplift_scores : np.ndarray
-        **Raw** predicted CATE per sample (E[Y|T=1] − E[Y|T=0]).
+        Predicted uplift where higher = more treatment benefit
+        (for churn tasks, pass ``-CATE`` = retention CATE).
 
     Returns
     -------
@@ -1667,6 +1706,306 @@ def qini_coefficient(
         return float(result.iloc[0]) if hasattr(result, "iloc") else float(result)
     except Exception:
         return np.nan
+
+
+# Default colors for Qini curve plots (same order as typical use: models then Random).
+# Matplotlib default cycle first 4 + gray for baseline.
+QINI_CURVE_COLORS = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"]
+
+
+def get_qini_curve_single(
+    y_true: np.ndarray,
+    treatment: np.ndarray,
+    uplift_scores: np.ndarray,
+    n_points: int = 101,
+    normalize: bool = False,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Qini curve for a single set (one fold or one test set). General for any holdout.
+
+    Uses CausalML get_qini; returns (fractions, values) on a fixed grid so curves
+    from different sample sizes can be averaged (e.g. mean over folds).
+
+    CausalML sorts by descending ``uplift_scores`` and computes cumulative
+    ``treated_positive − control_positive × (N_T / N_C)``.  For the curve
+    to go **up** when the model is good, ``y_true=1`` must be the
+    **desirable** outcome and higher ``uplift_scores`` must correspond
+    to individuals who benefit most from treatment.
+
+    **Churn convention:** callers should pass ``1 − y`` (retention) and
+    ``-CATE`` so that retained (Y=1) is good and persuadables rank first.
+
+    Parameters
+    ----------
+    y_true : np.ndarray
+        Binary outcome where Y=1 is the desirable outcome
+        (for churn tasks, pass ``1 - churn`` = retention).
+    treatment : np.ndarray
+        Treatment indicator (1 = treated, 0 = control).
+    uplift_scores : np.ndarray
+        Predicted uplift where higher = more treatment benefit
+        (for churn tasks, pass ``-CATE`` = retention CATE).
+    n_points : int
+        Number of fraction points (0 to 1). Default 101.
+    normalize : bool
+        If True, normalize curve to max |value| = 1 (CausalML convention).
+
+    Returns
+    -------
+    fractions : np.ndarray
+        Fraction of population (0 to 1), shape (n_points,).
+    values : np.ndarray
+        Qini curve values at each fraction, shape (n_points,).
+    """
+    if causalml_get_qini is None or len(y_true) == 0:
+        frac = np.linspace(0, 1, n_points)
+        return frac, np.full(n_points, np.nan)
+    try:
+        df_qini = pd.DataFrame(
+            {"y": y_true, "w": treatment, "pred": np.asarray(uplift_scores).ravel()}
+        )
+        qini_df = causalml_get_qini(
+            df_qini, outcome_col="y", treatment_col="w", normalize=normalize
+        )
+        # qini_df: index 0..n, one column "pred"
+        if "pred" not in qini_df.columns or len(qini_df) < 2:
+            frac = np.linspace(0, 1, n_points)
+            return frac, np.full(n_points, np.nan)
+        # CausalML returns raw cumulative counts; normalise by population size
+        # so the y-axis shows incremental gain as a proportion (matches standard
+        # Qini references, e.g. Kaggle/sklift, where y ∈ [0, ~0.06]).
+        n_samples = len(y_true)
+        vals_raw = qini_df["pred"].values / max(1, n_samples)
+        frac_raw = np.arange(len(vals_raw), dtype=float) / max(1, len(vals_raw) - 1)
+        if len(frac_raw) == 0:
+            frac_raw = np.array([0.0, 1.0])
+            vals_raw = np.array([0.0, 0.0])
+        frac_grid = np.linspace(0, 1, n_points)
+        vals_interp = np.interp(frac_grid, frac_raw, vals_raw)
+        return frac_grid, vals_interp
+    except Exception:
+        frac = np.linspace(0, 1, n_points)
+        return frac, np.full(n_points, np.nan)
+
+
+def aggregate_qini_curves_over_folds(
+    curves_per_fold: list[tuple[np.ndarray, np.ndarray]],
+    n_points: int = 101,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Average Qini curves over folds. Each fold curve should be on the same fraction grid.
+
+    Parameters
+    ----------
+    curves_per_fold : list of (fractions, values)
+        Each from get_qini_curve_single(..., n_points=n_points).
+    n_points : int
+        Expected length of each curve (for validation).
+
+    Returns
+    -------
+    fractions : np.ndarray
+        Common grid (0 to 1).
+    mean_vals : np.ndarray
+        Mean curve.
+    std_vals : np.ndarray
+        Std across folds (NaN if single fold).
+    """
+    if not curves_per_fold:
+        frac = np.linspace(0, 1, n_points)
+        return frac, np.full(n_points, np.nan), np.full(n_points, np.nan)
+    # Assume all on same grid (from get_qini_curve_single with same n_points)
+    stacked = np.array([c[1] for c in curves_per_fold])
+    frac = curves_per_fold[0][0]
+    mean_vals = np.nanmean(stacked, axis=0)
+    std_vals = np.nanstd(stacked, axis=0) if stacked.shape[0] > 1 else np.full(frac.shape[0], np.nan)
+    return frac, mean_vals, std_vals
+
+
+def get_validation_qini_curves(
+    X: pd.DataFrame,
+    y: np.ndarray,
+    treatment: np.ndarray,
+    candidate_defs: list[tuple[str, str, str]],
+    cv_summary: pd.DataFrame,
+    top_n: int = 3,
+    n_splits: int = 5,
+    random_state: int = RANDOM_STATE,
+    scale_pos_weight: float = 1.0,
+    n_points: int = 101,
+) -> dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """Qini curves for top_n models + Random, mean (and std) across CV folds.
+
+    For each candidate and each fold: fit on train, predict on val, compute Qini curve
+    on val. Then average curve values at each fraction across folds. General design
+    allows single test set in future by passing n_splits=1 and appropriate data.
+
+    Internally converts churn to retention (``1 − y``) and negates CATE
+    (``-raw_pred``) before calling CausalML, so the Qini curve goes UP when
+    the model correctly targets persuadables (standard Qini convention where
+    ``y=1`` is the desirable outcome).
+
+    Parameters
+    ----------
+    X, y, treatment : as in run_uplift_cv (y is churn 0/1).
+    candidate_defs, cv_summary : candidate list and summary table (for top_n by auuc_mean).
+    top_n : int
+        Number of top candidates by mean AUUC.
+    n_splits, random_state, scale_pos_weight : CV and model args.
+    n_points : int
+        Points on fraction axis for Qini curve.
+
+    Returns
+    -------
+    dict[str, (fractions, mean_vals, std_vals)]
+        Keys: model name or "Random baseline".
+    """
+    from sklearn.model_selection import StratifiedKFold
+
+    stratify = 2 * treatment + y
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    splits = list(skf.split(X, stratify))
+    X_df = X if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
+    order = cv_summary.sort_values("auuc_mean", ascending=False)["candidate"].tolist()
+    defs_by_name = {c[0]: (c[1], c[2]) for c in candidate_defs}
+    result: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+    rng = np.random.default_rng(random_state)
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="X does not have valid feature names",
+            category=UserWarning,
+            module="sklearn.utils.validation",
+        )
+        for name in order[:top_n]:
+            if name not in defs_by_name:
+                continue
+            meta_key, base_key = defs_by_name[name]
+            curves_fold = []
+            for train_idx, val_idx in splits:
+                X_tr = X_df.iloc[train_idx]
+                X_val = X_df.iloc[val_idx]
+                y_val = y[val_idx]
+                t_val = treatment[val_idx]
+                model = build_model(meta_key, base_key, scale_pos_weight)
+                model.fit(X_tr, treatment[train_idx], y[train_idx])
+                pred = model.predict(X_val)
+                raw_pred = np.asarray(pred).ravel()
+                # Churn → retention convention for Qini:
+                # CausalML's get_qini sorts by descending pred and computes
+                # treated_positive − control_positive * ratio. For the curve to
+                # go UP (good model above random diagonal), Y=1 must be the
+                # "good" outcome and higher score must mean more treatment benefit.
+                # raw CATE = E[churn|T=1] - E[churn|T=0] → negative for persuadables.
+                # Flip: retention = 1-y (Y=1 = retained = good), neg_pred = -CATE
+                # = E[retention|T=1] - E[retention|T=0] → positive for persuadables.
+                neg_pred = -raw_pred
+                retention = 1 - y_val
+                frac, vals = get_qini_curve_single(retention, t_val, neg_pred, n_points=n_points)
+                curves_fold.append((frac, vals))
+            frac, mean_vals, std_vals = aggregate_qini_curves_over_folds(curves_fold, n_points=n_points)
+            result[name] = (frac, mean_vals, std_vals)
+
+        # Random baseline: one random permutation per fold (still use retention outcome)
+        curves_fold = []
+        for train_idx, val_idx in splits:
+            y_val = y[val_idx]
+            t_val = treatment[val_idx]
+            n_val = len(y_val)
+            retention = 1 - y_val
+            random_pred = rng.permutation(np.arange(n_val, dtype=float))  # shuffle indices as proxy
+            frac, vals = get_qini_curve_single(retention, t_val, random_pred, n_points=n_points)
+            curves_fold.append((frac, vals))
+        frac, mean_vals, std_vals = aggregate_qini_curves_over_folds(curves_fold, n_points=n_points)
+        result["Random baseline"] = (frac, mean_vals, std_vals)
+
+    return result
+
+
+def plot_qini_curves_comparison(
+    curves: dict[str, tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, np.ndarray]],
+    ax: plt.Axes | None = None,
+    save_path: str | Path | None = None,
+    colors: list[str] | None = None,
+    legend_outside: bool | None = None,
+) -> plt.Axes:
+    """Overlay Qini curves (mean over folds) with diagonal random baseline.
+
+    Each value in *curves* is (fractions, mean_vals) or (fractions, mean_vals, std_vals).
+    Draws a gray dashed diagonal from (0,0) to (1, gain_at_100%) as the
+    random-targeting baseline (standard Qini convention). If "Random baseline"
+    is in curves, it is not drawn as a separate curve; only the diagonal
+    represents random.
+
+    Parameters
+    ----------
+    curves : dict mapping label -> (frac, mean[, std])
+    ax, save_path : optional axes and save path.
+    colors : optional list of color specs; default QINI_CURVE_COLORS.
+    legend_outside : bool or None
+        If True, place legend outside plot (right) with compact layout.
+        If None, auto: outside when more than 4 curve labels (e.g. HP grid plot).
+    """
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(8, 5))
+    if colors is None:
+        colors = QINI_CURVE_COLORS
+    n_curves = sum(1 for k in curves if k != "Random baseline")
+    if legend_outside is None:
+        legend_outside = n_curves > 4
+
+    # Diagonal end = cumulative gain at 100% (same for any targeting order).
+    # Use "Random baseline" curve end point if present; else first curve.
+    y_end = np.nan
+    if "Random baseline" in curves:
+        mean_vals = curves["Random baseline"][1]
+        if len(mean_vals) and np.isfinite(mean_vals[-1]):
+            y_end = float(mean_vals[-1])
+    if not np.isfinite(y_end):
+        for _, data in curves.items():
+            mean_vals = data[1]
+            if len(mean_vals) and np.isfinite(mean_vals[-1]):
+                y_end = float(mean_vals[-1])
+                break
+    if not np.isfinite(y_end):
+        y_end = 0.0
+
+    # Draw diagonal random baseline first (gray dashed, like reference Qini plots).
+    ax.plot([0, 1], [0, y_end], "--", color="gray", linewidth=2, label="Random baseline")
+
+    # Plot model curves (skip empirical "Random baseline" curve; diagonal is the baseline).
+    color_index = 0
+    for label, data in curves.items():
+        if label == "Random baseline":
+            continue
+        # Unpack; std_vals are computed but not plotted (clean chart, no bands).
+        frac = data[0]
+        mean_vals = data[1]
+        valid = ~np.isnan(mean_vals)
+        if valid.sum() < 2:
+            continue
+        color = colors[color_index % len(colors)]
+        color_index += 1
+        ax.plot(frac[valid], mean_vals[valid], label=label, linewidth=2, color=color)
+    ax.set_xlabel("Proportion targeted")
+    ax.set_ylabel("Uplift")
+    ax.set_title("Qini curves (mean over CV folds)")
+    # When many curves (e.g. top-10 HP combos), put legend below in 2 columns so it doesn't cover the plot.
+    if legend_outside:
+        ax.legend(
+            loc="upper center",
+            bbox_to_anchor=(0.5, -0.14),
+            ncol=2,
+            fontsize="small",
+            frameon=True,
+        )
+        plt.tight_layout(rect=[0, 0.22, 1, 1])  # leave room for legend below (2-col, many rows)
+    else:
+        ax.legend(loc="best", frameon=True)
+        plt.tight_layout()
+    set_axes_clear(ax, x_axis_at_zero=False)
+    if save_path is not None:
+        ax.figure.savefig(Path(save_path), bbox_inches="tight", dpi=150)
+    return ax
 
 
 def run_uplift_cv(
@@ -1798,12 +2137,12 @@ def _run_uplift_cv_loop(
             )
             auuc = approx_auuc(ks, uplift_vals)
 
-            # CausalML's qini_score sorts by descending prediction and internally
-            # computes treated_outcome − control_outcome.  It expects raw CATE
-            # (positive CATE = treatment increases Y).  A model that correctly
-            # ranks individuals by their CATE produces a positive Qini regardless
-            # of whether Y=1 is "good" or "bad".
-            qini = qini_coefficient(y_val, t_val, raw_pred)
+            # Churn → retention for Qini: CausalML's qini_score sorts by
+            # descending score and computes treated_positive − control_positive
+            # ratio.  For the coefficient to be positive when the model is good,
+            # Y=1 must be the "good" outcome → use retention (1-y) and negated
+            # CATE (neg_pred) so persuadables rank first.
+            qini = qini_coefficient(1 - y_val, t_val, neg_pred)
 
             row: dict = {
                 "candidate": name,
@@ -1973,95 +2312,6 @@ def plot_uplift_at_k_comparison(
     return ax
 
 
-def get_validation_uplift_curves(
-    X: pd.DataFrame,
-    y: np.ndarray,
-    treatment: np.ndarray,
-    candidate_defs: list[tuple[str, str, str]],
-    cv_summary: pd.DataFrame,
-    top_n: int = 3,
-    fold: int = 0,
-    n_splits: int = 5,
-    random_state: int = RANDOM_STATE,
-    scale_pos_weight: float = 1.0,
-    n_curve_points: int = 100,
-) -> dict[str, tuple[np.ndarray, np.ndarray]]:
-    """Get uplift curves (ks, uplift_vals) on one validation fold for top_n models and random baseline."""
-    from sklearn.model_selection import StratifiedKFold
-
-    stratify = 2 * treatment + y
-    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
-    splits = list(skf.split(X, stratify))
-    if fold >= len(splits):
-        fold = 0
-    train_idx, val_idx = splits[fold]
-    X_val = X.iloc[val_idx]
-    y_val = y[val_idx]
-    t_val = treatment[val_idx]
-    order = cv_summary.sort_values("auuc_mean", ascending=False)["candidate"].tolist()
-    defs_by_name = {c[0]: (c[1], c[2]) for c in candidate_defs}
-    curves: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-    pred_for_baseline: np.ndarray | None = None
-    with warnings.catch_warnings():
-        warnings.filterwarnings(
-            "ignore",
-            message="X does not have valid feature names",
-            category=UserWarning,
-            module="sklearn.utils.validation",
-        )
-        for name in order[:top_n]:
-            if name not in defs_by_name:
-                continue
-            meta_key, base_key = defs_by_name[name]
-            X_tr, y_tr = X.iloc[train_idx], y[train_idx]
-            t_tr = treatment[train_idx]
-            model = build_model(meta_key, base_key, scale_pos_weight)
-            model.fit(X_tr, t_tr, y_tr)
-            pred = model.predict(X_val)
-            # Negate CATE for churn: higher = more beneficial treatment.
-            neg_pred = -np.asarray(pred).ravel()
-            if pred_for_baseline is None:
-                pred_for_baseline = neg_pred.copy()
-            ks, uplift_vals = uplift_curve(
-                y_val, t_val, neg_pred, n_points=n_curve_points
-            )
-            curves[name] = (ks, uplift_vals)
-    rng = np.random.default_rng(random_state)
-    random_pred = (
-        rng.permutation(pred_for_baseline)
-        if pred_for_baseline is not None
-        else rng.random(len(y_val))
-    )
-    ks, random_vals = uplift_curve(y_val, t_val, random_pred, n_points=n_curve_points)
-    curves["Random baseline"] = (ks, random_vals)
-    return curves
-
-
-def plot_uplift_curves_comparison(
-    curves: dict[str, tuple[np.ndarray, np.ndarray]],
-    ax: plt.Axes | None = None,
-    save_path: str | Path | None = None,
-) -> plt.Axes:
-    """Overlay uplift curves with legend (for write-up)."""
-    if ax is None:
-        fig, ax = plt.subplots(figsize=(8, 5))
-    for label, (ks, vals) in curves.items():
-        valid = ~np.isnan(vals)
-        if valid.sum() < 2:
-            continue
-        ax.plot(ks[valid], vals[valid], label=label, linewidth=2)
-    ax.set_xlabel("Fraction of population (sorted by predicted uplift)")
-    ax.set_ylabel("Churn rate difference")
-    ax.set_title("Uplift curves on validation fold (top models vs random baseline)")
-    ax.legend()
-    ax.axhline(0, color="gray", linestyle="--")
-    set_axes_clear(ax, x_axis_at_zero=False)
-    plt.tight_layout()
-    if save_path is not None:
-        plt.savefig(Path(save_path), bbox_inches="tight", dpi=150)
-    return ax
-
-
 def save_uplift_cv_report(
     cv_summary: pd.DataFrame,
     table_path: str | Path,
@@ -2096,21 +2346,20 @@ def save_uplift_cv_report(
         and treatment is not None
         and candidate_defs is not None
     ):
-        curves = get_validation_uplift_curves(
+        curves = get_validation_qini_curves(
             X,
             y,
             treatment,
             candidate_defs,
             cv_summary,
             top_n=top_n_curves,
-            fold=0,
             n_splits=n_splits,
             random_state=random_state,
             scale_pos_weight=scale_pos_weight,
         )
         fig3, ax3 = plt.subplots(figsize=(8, 5))
-        plot_uplift_curves_comparison(
-            curves, ax=ax3, save_path=Path(figure_dir) / "uplift_curves_comparison.png"
+        plot_qini_curves_comparison(
+            curves, ax=ax3, save_path=Path(figure_dir) / "qini_curves_comparison.png"
         )
         plt.close(fig3)
 
@@ -2129,3 +2378,299 @@ def select_best_uplift_model(
     else:
         best_idx = cv_summary[mean_col].idxmin()
     return str(cv_summary.loc[best_idx, "candidate"])
+
+
+# ---------------------------------------------------------------------------
+# Hyperparameter Tuning — Grid Search (Section 6)
+# ---------------------------------------------------------------------------
+
+
+def run_uplift_hp_grid_search(
+    X: pd.DataFrame,
+    y: np.ndarray,
+    treatment: np.ndarray,
+    meta_key: str,
+    base_key: str,
+    param_grid: dict[str, list],
+    n_splits: int = 5,
+    random_state: int = RANDOM_STATE,
+    scale_pos_weight: float = 1.0,
+    n_curve_points: int = 100,
+    uplift_k_fracs: list[float] | None = None,
+) -> list[dict]:
+    """Run grid search over base-learner hyperparameters for one meta-learner.
+
+    For every combination in *param_grid*, runs stratified K-fold CV and
+    records per-fold AUUC, Qini, and uplift@k metrics.
+
+    Parameters
+    ----------
+    X : pd.DataFrame
+        Feature matrix (numeric).
+    y : np.ndarray
+        Binary outcome (churn 0/1).
+    treatment : np.ndarray
+        Treatment indicator (1 = treated, 0 = control).
+    meta_key : str
+        'S' or 'T'.
+    base_key : str
+        'LGBM' or 'XGB'.
+    param_grid : dict[str, list]
+        e.g. ``{'max_depth': [3, 5, 7], 'learning_rate': [0.05, 0.1]}``.
+    n_splits : int
+        Number of CV folds.
+    random_state : int
+        Seed for StratifiedKFold.
+    scale_pos_weight : float
+        Passed to XGBoost base learner (ignored for LGBM).
+    n_curve_points : int
+        Points for the uplift curve (AUUC computation).
+    uplift_k_fracs : list[float] | None
+        Fractions for uplift@k.  Default [0.05, 0.1, 0.2].
+
+    Returns
+    -------
+    list[dict]
+        One dict per (param_combo, fold) with keys: params_str, fold, auuc,
+        qini, uplift_at_k_*, plus each individual hyperparameter.
+    """
+    import itertools
+
+    if uplift_k_fracs is None:
+        uplift_k_fracs = [0.05, 0.1, 0.2]
+
+    # --- Validate y and treatment (same logic as run_uplift_cv) ---
+    y_ = np.asarray(y, dtype=np.float64)
+    t_ = np.asarray(treatment, dtype=np.float64)
+    valid = np.isfinite(y_) & np.isin(t_, (0.0, 1.0)) & np.isin(y_, (0.0, 1.0))
+    if not np.all(valid):
+        X = X.loc[valid] if isinstance(X, pd.DataFrame) else X[valid]
+        y = np.asarray(y_[valid], dtype=np.float64)
+        treatment = np.asarray(t_[valid], dtype=np.float64)
+        y = (y > 0.5).astype(np.int64)
+        treatment = (treatment > 0.5).astype(np.int64)
+    else:
+        y = (np.asarray(y, dtype=np.float64) > 0.5).astype(np.int64)
+        treatment = (np.asarray(treatment, dtype=np.float64) > 0.5).astype(np.int64)
+
+    # Build all combinations from the parameter grid
+    param_names = sorted(param_grid.keys())
+    param_values = [param_grid[k] for k in param_names]
+    combos = [dict(zip(param_names, vals)) for vals in itertools.product(*param_values)]
+    n_combos = len(combos)
+
+    # Prepare StratifiedKFold (same stratification as Section 5)
+    from sklearn.model_selection import StratifiedKFold
+
+    stratify = 2 * treatment + y
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    splits = list(skf.split(X, stratify))
+
+    X_df = X if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
+    results: list[dict] = []
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="X does not have valid feature names",
+            category=UserWarning,
+            module="sklearn.utils.validation",
+        )
+        for combo_idx, params in enumerate(combos):
+            # Readable label for this combination
+            params_str = ", ".join(f"{k}={v}" for k, v in sorted(params.items()))
+            for fold, (train_idx, val_idx) in enumerate(splits):
+                X_tr = X_df.iloc[train_idx]
+                X_val = X_df.iloc[val_idx]
+                y_tr, y_val = y[train_idx], y[val_idx]
+                t_tr, t_val = treatment[train_idx], treatment[val_idx]
+
+                model = build_model(
+                    meta_key, base_key, scale_pos_weight, base_params=params
+                )
+                model.fit(X_tr, t_tr, y_tr)
+                pred = model.predict(X_val)
+
+                # Same sign-convention split as run_uplift_cv
+                raw_pred = np.asarray(pred).ravel()
+                neg_pred = -raw_pred
+
+                ks, uplift_vals = uplift_curve(
+                    y_val, t_val, neg_pred, n_points=n_curve_points
+                )
+                auuc = approx_auuc(ks, uplift_vals)
+                # Churn → retention for Qini (see run_uplift_cv for rationale)
+                qini = qini_coefficient(1 - y_val, t_val, neg_pred)
+
+                row: dict = {
+                    "params_str": params_str,
+                    "fold": fold,
+                    "auuc": auuc,
+                    "qini": qini,
+                }
+                # Store each HP as its own column for easy filtering
+                for k, v in params.items():
+                    row[k] = v
+                for frac in uplift_k_fracs:
+                    key = f"uplift_at_k_{int(frac * 100)}"
+                    row[key] = uplift_at_k(y_val, t_val, neg_pred, frac)
+                results.append(row)
+
+            # Progress feedback every 10 combos
+            if (combo_idx + 1) % 10 == 0 or combo_idx == n_combos - 1:
+                print(
+                    f"  Grid search: {combo_idx + 1}/{n_combos} combos done "
+                    f"({(combo_idx + 1) * n_splits} fits)"
+                )
+
+    return results
+
+
+def build_hp_grid_search_table(
+    grid_results: list[dict],
+    metric_cols: list[str] | None = None,
+) -> pd.DataFrame:
+    """Aggregate grid-search results into mean ± std per parameter combo.
+
+    Parameters
+    ----------
+    grid_results : list[dict]
+        Output from :func:`run_uplift_hp_grid_search`.
+    metric_cols : list[str] | None
+        Metrics to aggregate.  Default: auuc, qini, uplift_at_k_5/10/20.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per combo, sorted by descending auuc_mean.
+    """
+    if metric_cols is None:
+        metric_cols = ["auuc", "qini", "uplift_at_k_5", "uplift_at_k_10", "uplift_at_k_20"]
+    df = pd.DataFrame(grid_results)
+    present = [m for m in metric_cols if m in df.columns]
+    agg_dict: dict = {}
+    for m in present:
+        agg_dict[f"{m}_mean"] = (m, "mean")
+        agg_dict[f"{m}_std"] = (m, "std")
+    summary = df.groupby("params_str").agg(**agg_dict).reset_index()
+    # Sort by primary metric descending
+    if "auuc_mean" in summary.columns:
+        summary = summary.sort_values("auuc_mean", ascending=False).reset_index(drop=True)
+    return summary
+
+
+def get_qini_curves_top_hp_combos(
+    X: pd.DataFrame,
+    y: np.ndarray,
+    treatment: np.ndarray,
+    grid_summary: pd.DataFrame,
+    grid_results: list[dict],
+    meta_key: str,
+    base_key: str,
+    param_grid: dict[str, list],
+    top_n: int = 10,
+    n_splits: int = 5,
+    random_state: int = RANDOM_STATE,
+    scale_pos_weight: float = 1.0,
+    n_points: int = 101,
+) -> dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """Qini curves for top_n hyperparameter combos, mean (and std) across CV folds.
+
+    Re-fits only the top_n combos over the same CV splits and computes Qini curve
+    per fold, then aggregates. General design allows single test set in future.
+
+    Internally converts churn to retention (``1 − y``) and negates CATE before
+    calling CausalML (same convention as ``get_validation_qini_curves``).
+
+    Parameters
+    ----------
+    X, y, treatment : as in run_uplift_hp_grid_search (y is churn 0/1).
+    grid_summary : pd.DataFrame
+        Output from build_hp_grid_search_table (used to get top params_str by auuc_mean).
+    grid_results : list[dict]
+        Output from run_uplift_hp_grid_search (used to recover param dict per params_str).
+    meta_key, base_key, param_grid : as in run_uplift_hp_grid_search.
+    top_n : int
+        Number of top combos. Default 10.
+    n_splits, random_state, scale_pos_weight, n_points : as in get_validation_qini_curves.
+
+    Returns
+    -------
+    dict[params_str, (fractions, mean_vals, std_vals)]
+    """
+    from sklearn.model_selection import StratifiedKFold
+
+    param_names = sorted(param_grid.keys())
+    top_params_str = grid_summary.head(top_n)["params_str"].tolist()
+    # Recover param dict for each params_str from first occurrence in grid_results
+    df_res = pd.DataFrame(grid_results)
+    result: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+    stratify = 2 * treatment + y
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    splits = list(skf.split(X, stratify))
+    X_df = X if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="X does not have valid feature names",
+            category=UserWarning,
+            module="sklearn.utils.validation",
+        )
+        for params_str in top_params_str:
+            row = df_res[df_res["params_str"] == params_str].iloc[0]
+            params = {k: row[k] for k in param_names if k in row}
+            curves_fold = []
+            for train_idx, val_idx in splits:
+                X_tr = X_df.iloc[train_idx]
+                X_val = X_df.iloc[val_idx]
+                y_val = y[val_idx]
+                t_val = treatment[val_idx]
+                model = build_model(meta_key, base_key, scale_pos_weight, base_params=params)
+                model.fit(X_tr, treatment[train_idx], y[train_idx])
+                pred = model.predict(X_val)
+                raw_pred = np.asarray(pred).ravel()
+                # Churn → retention for Qini (see get_validation_qini_curves for rationale)
+                neg_pred = -raw_pred
+                retention = 1 - y_val
+                frac, vals = get_qini_curve_single(retention, t_val, neg_pred, n_points=n_points)
+                curves_fold.append((frac, vals))
+            frac, mean_vals, std_vals = aggregate_qini_curves_over_folds(curves_fold, n_points=n_points)
+            result[params_str] = (frac, mean_vals, std_vals)
+
+    return result
+
+
+def save_hp_grid_search_report(
+    grid_summary: pd.DataFrame,
+    table_path: str | Path,
+    figure_dir: str | Path,
+    top_n_plot: int = 10,
+    qini_curves: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] | None = None,
+) -> None:
+    """Save grid-search table (CSV) and optionally Qini curves figure to disk.
+
+    Parameters
+    ----------
+    grid_summary : pd.DataFrame
+        Output from :func:`build_hp_grid_search_table`.
+    table_path : str | Path
+        CSV file path for the full table.
+    figure_dir : str | Path
+        Directory for saved figures.
+    top_n_plot : int
+        Unused if qini_curves provided; kept for API compatibility.
+    qini_curves : dict or None
+        If provided (e.g. from get_qini_curves_top_hp_combos), save Qini curve plot.
+    """
+    table_path = Path(table_path)
+    figure_dir = Path(figure_dir)
+    table_path.parent.mkdir(parents=True, exist_ok=True)
+    figure_dir.mkdir(parents=True, exist_ok=True)
+    grid_summary.to_csv(table_path, index=False)
+    if qini_curves:
+        fig, ax = plt.subplots(figsize=(8, 5))
+        plot_qini_curves_comparison(
+            qini_curves, ax=ax, save_path=figure_dir / "hp_grid_search_qini_curves.png"
+        )
+        plt.close(fig)
