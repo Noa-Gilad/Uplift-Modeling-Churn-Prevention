@@ -1582,21 +1582,176 @@ def approx_auuc(ks: np.ndarray, uplift_vals: np.ndarray) -> float:
     return float(np.trapz(uplift_vals[valid], ks[valid]))
 
 
-def assign_segments(uplift_scores: np.ndarray) -> np.ndarray:
-    """Assign four uplift segments based on predicted-uplift quartiles.
+def assign_segments(
+    uplift_scores: np.ndarray,
+    baseline_scores: np.ndarray | None = None,
+    uplift_threshold: float | str | None = None,
+    zero_epsilon: float | None = None,
+) -> np.ndarray:
+    """Assign four uplift segments using formal definitions (Radcliffe / uplift literature).
+
+    **Formal definitions** (default when *baseline_scores* is provided):
+    * **Persuadables**: uplift **> ε** — positive incremental effect; only segment to target.
+    * **Sure Things**: **|uplift| ≤ ε** AND **low baseline** (low churn) — would retain anyway; 0 gain.
+    * **Lost Causes**: **|uplift| ≤ ε** AND **high baseline** (high churn) — will churn anyway; 0 gain.
+    * **Do-Not-Disturb**: uplift **< −ε** — negative incremental effect; avoid.
+
+    Sure Things and Lost Causes both have **zero uplift** (no incremental effect); the only
+    difference is baseline churn risk. Segment sizes are data-driven (depend on score distribution).
+
+    *uplift_threshold* (when baseline_scores is set):
+    * ``None`` (default): Formal definition — zero band |uplift| ≤ ε, split by baseline.
+    * ``"median"``: Persuadables = top 50% (uplift >= median); below median split by baseline.
+    * ``"percentile"``: bottom 25% = DND, top 50% = Persuadables, middle 25% by baseline.
+    * A float (e.g. 0.01): Persuadables = uplift > that value; zero band and low band by baseline.
+
+    *zero_epsilon*: half-width of zero band (|uplift| ≤ ε). Also DND boundary (uplift < −ε).
+    If None, default 0.01.
+
+    When *baseline_scores* is None, falls back to a quartile split on uplift only.
+
+    Parameters
+    ----------
+    uplift_scores : np.ndarray
+        Predicted uplift (higher = more benefit from treatment).
+        For churn tasks, pass ``-CATE`` (retention uplift).
+    baseline_scores : np.ndarray or None
+        Predicted baseline outcome (e.g. P(churn | no treatment)).
+        Higher = more at-risk. If None, use quartile fallback.
+    uplift_threshold : float, "percentile", "median", "zero", or None, default None
+        None (default) = formal definition (zero band |uplift| ≤ ε, split by baseline);
+        "median" = top 50% = Persuadables; "percentile" = p25/p50; float = fixed cutoff.
+    zero_epsilon : float or None, default None
+        Zero-band half-width (|uplift| ≤ ε) and DND boundary. If None, 0.01 for formal default.
 
     Returns
     -------
     np.ndarray of str
         Segment labels: Persuadables, Sure Things, Lost Causes, Do-Not-Disturb.
     """
-    q25, q50, q75 = np.nanquantile(uplift_scores, [0.25, 0.50, 0.75])
     seg = np.empty(len(uplift_scores), dtype=object)
-    seg[uplift_scores >= q75] = "Persuadables"
-    seg[(uplift_scores >= q50) & (uplift_scores < q75)] = "Sure Things"
-    seg[(uplift_scores >= q25) & (uplift_scores < q50)] = "Lost Causes"
-    seg[uplift_scores < q25] = "Do-Not-Disturb"
+
+    if baseline_scores is not None:
+        baseline_median = float(np.nanmedian(baseline_scores))
+        baseline_high = baseline_scores >= baseline_median
+
+        use_percentile = (
+            isinstance(uplift_threshold, str)
+            and uplift_threshold.strip().lower() == "percentile"
+        )
+        use_median = (
+            isinstance(uplift_threshold, str)
+            and uplift_threshold.strip().lower() == "median"
+        )
+
+        if use_percentile:
+            # ── Percentile-based: top 50% = Persuadables, bottom 25% = DND ─────
+            p25 = float(np.nanpercentile(uplift_scores, 25))
+            p50 = float(np.nanpercentile(uplift_scores, 50))
+            top_uplift = uplift_scores >= p50
+            bottom_uplift = uplift_scores < p25
+            middle_uplift = (uplift_scores >= p25) & (uplift_scores < p50)
+            seg[top_uplift] = "Persuadables"
+            seg[bottom_uplift] = "Do-Not-Disturb"
+            # Sure Things = low baseline (retain anyway), Lost Causes = high baseline
+            seg[middle_uplift & baseline_high] = "Lost Causes"
+            seg[middle_uplift & ~baseline_high] = "Sure Things"
+        elif use_median:
+            # ── Median-based: Persuadables = top 50% (>= median) ─────────────────
+            eps = 0.005 if zero_epsilon is None else float(zero_epsilon)
+            uplift_median = float(np.nanmedian(uplift_scores))
+            seg[uplift_scores < -eps] = "Do-Not-Disturb"
+            seg[uplift_scores >= uplift_median] = "Persuadables"
+            in_band = (uplift_scores >= -eps) & (uplift_scores < uplift_median)
+            seg[in_band & baseline_high] = "Lost Causes"
+            seg[in_band & ~baseline_high] = "Sure Things"
+        elif uplift_threshold is None or (
+            isinstance(uplift_threshold, str)
+            and uplift_threshold.strip().lower() in ("zero", "zero_band")
+        ):
+            # ── Formal definition (default): Sure Things & Lost Causes = zero uplift band ─
+            # |uplift| ≤ ε → 0 gain; split by baseline. Persuadables = uplift > ε; DND = uplift < −ε.
+            eps = 0.01 if zero_epsilon is None else float(zero_epsilon)
+            seg[uplift_scores < -eps] = "Do-Not-Disturb"
+            seg[uplift_scores > eps] = "Persuadables"
+            in_zero_band = np.abs(uplift_scores) <= eps
+            seg[in_zero_band & baseline_high] = "Lost Causes"
+            seg[in_zero_band & ~baseline_high] = "Sure Things"
+        else:
+            # ── Fixed threshold: Persuadables = uplift > threshold ─────────────
+            if uplift_threshold is None or (
+                isinstance(uplift_threshold, (int, float)) and uplift_threshold == 0
+            ):
+                uplift_cut = 0.0
+            else:
+                uplift_cut = float(uplift_threshold)
+            if zero_epsilon is None:
+                eps = 0.005 if uplift_cut == 0 else max(0.005, uplift_cut / 2.0)
+            else:
+                eps = float(zero_epsilon)
+            seg[uplift_scores < -eps] = "Do-Not-Disturb"
+            seg[uplift_scores > uplift_cut] = "Persuadables"
+            # Zero band |uplift| < ε: split by baseline (Sure Things = low, Lost Causes = high)
+            in_zero_band = np.abs(uplift_scores) < eps
+            seg[in_zero_band & baseline_high] = "Lost Causes"
+            seg[in_zero_band & ~baseline_high] = "Sure Things"
+            # Low-uplift band (ε <= uplift <= threshold): split by baseline
+            in_low_band = (uplift_scores >= eps) & (uplift_scores <= uplift_cut)
+            seg[in_low_band & baseline_high] = "Lost Causes"
+            seg[in_low_band & ~baseline_high] = "Sure Things"
+    else:
+        # ── Quartile fallback (1-D, backward compatible) ────────────
+        q25, q50, q75 = np.nanquantile(uplift_scores, [0.25, 0.50, 0.75])
+        seg[uplift_scores >= q75] = "Persuadables"
+        seg[(uplift_scores >= q50) & (uplift_scores < q75)] = "Sure Things"
+        seg[(uplift_scores >= q25) & (uplift_scores < q50)] = "Lost Causes"
+        seg[uplift_scores < q25] = "Do-Not-Disturb"
+
     return seg
+
+
+def predict_baseline_slearner(
+    model,
+    X: np.ndarray | pd.DataFrame,
+) -> np.ndarray:
+    """Extract P(Y | X, T=0) — the control/baseline prediction from a fitted S-Learner.
+
+    CausalML's ``BaseSLearner.fit()`` stores fitted models in
+    ``self.models``  — a dict keyed by treatment group.  Each model was
+    trained on ``[treatment_indicator | X]`` (treatment **prepended** as
+    the first column).  To obtain the baseline (control) prediction we
+    build ``[0 | X]`` and call the fitted model's ``.predict()``.
+
+    Parameters
+    ----------
+    model : BaseSRegressor (fitted)
+        A fitted CausalML S-Learner.
+    X : np.ndarray or pd.DataFrame
+        Feature matrix (same columns used during ``.fit()``, **without**
+        the treatment indicator).
+
+    Returns
+    -------
+    np.ndarray
+        Predicted outcome under control (T=0) for each observation.
+    """
+    X_arr = np.asarray(X)
+    n = X_arr.shape[0]
+    # CausalML BaseSLearner stores fitted models in self.models (dict),
+    # keyed by treatment group.  For binary treatment the only key is
+    # the treatment value (e.g. 1).  self.model is the *unfitted* template.
+    fitted_models = getattr(model, "models", None)
+    if fitted_models is None or len(fitted_models) == 0:
+        raise AttributeError(
+            "Cannot find fitted internal models on the S-Learner. "
+            "Expected attribute 'models' (dict). Has fit() been called?"
+        )
+    # Use the first (and typically only) treatment group's model
+    group_key = next(iter(fitted_models))
+    base_model = fitted_models[group_key]
+    # CausalML *prepends* treatment as the first column: [T | X]
+    X_control = np.hstack([np.zeros((n, 1)), X_arr])
+    return base_model.predict(X_control)
 
 
 def build_model(
@@ -2674,3 +2829,367 @@ def save_hp_grid_search_report(
             qini_curves, ax=ax, save_path=figure_dir / "hp_grid_search_qini_curves.png"
         )
         plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# Final Model — training, scoring, and test-set deliverables (Section 7)
+# ---------------------------------------------------------------------------
+
+
+def plot_cumulative_uplift_curve(
+    ks: np.ndarray,
+    uplift_vals: np.ndarray,
+    ax: plt.Axes | None = None,
+    label: str = "Model",
+    show_random: bool = True,
+    title: str = "Cumulative uplift curve",
+    save_path: str | Path | None = None,
+) -> plt.Axes:
+    """Plot a cumulative (realised) uplift curve.
+
+    Generic: accepts (ks, uplift_vals) from :func:`uplift_curve` or any
+    function that returns (fractions, values). Useful for train evaluation
+    and later for SHAP-based or business-metric curves.
+
+    Parameters
+    ----------
+    ks : np.ndarray
+        Fraction of population targeted (e.g. 0.01 … 1.0).
+    uplift_vals : np.ndarray
+        Realised uplift at each fraction (e.g. churn_control − churn_treated).
+    ax : plt.Axes or None
+        Axes to plot on; created if None.
+    label : str
+        Legend label for the model curve.
+    show_random : bool
+        If True, draw a horizontal dashed line at the overall uplift (last point).
+    title : str
+        Plot title.
+    save_path : str, Path, or None
+        If provided, save figure to this path.
+
+    Returns
+    -------
+    plt.Axes
+    """
+    if ax is None:
+        _, ax = plt.subplots(figsize=(8, 5))
+    valid = ~np.isnan(uplift_vals)
+    ax.plot(ks[valid], uplift_vals[valid], linewidth=2, label=label, color="#1f77b4")
+    if show_random and valid.sum() > 0:
+        # Random targeting = constant uplift equal to overall uplift (at 100%)
+        overall = uplift_vals[valid][-1] if valid.any() else 0.0
+        ax.axhline(overall, linestyle="--", color="gray", linewidth=1.5, label="Random baseline")
+    ax.set_xlabel("Proportion targeted")
+    ax.set_ylabel("Realised uplift (control − treated)")
+    ax.set_title(title)
+    ax.legend(loc="best", frameon=True)
+    set_axes_clear(ax, x_axis_at_zero=False)
+    plt.tight_layout()
+    if save_path is not None:
+        ax.figure.savefig(Path(save_path), bbox_inches="tight", dpi=150)
+    return ax
+
+
+def plot_uplift_by_decile(
+    y: np.ndarray,
+    treatment: np.ndarray,
+    uplift_scores: np.ndarray,
+    n_bins: int = 10,
+    ax: plt.Axes | None = None,
+    title: str = "Uplift by decile",
+    save_path: str | Path | None = None,
+) -> plt.Axes:
+    """Bar chart of realised uplift per decile (ranked by predicted uplift).
+
+    Sorts population by *uplift_scores* (descending), splits into *n_bins*
+    equal-sized bins, and computes realised uplift (control rate − treated rate)
+    in each bin. Requires labelled data (y, treatment).
+
+    Generic: can be reused with any score (e.g. SHAP-based) as long as
+    higher score = "target first".
+
+    Parameters
+    ----------
+    y : np.ndarray
+        Binary outcome (e.g. churn 0/1).
+    treatment : np.ndarray
+        Treatment indicator (1 = treated, 0 = control).
+    uplift_scores : np.ndarray
+        Predicted uplift; higher = target first (for churn pass -CATE).
+    n_bins : int
+        Number of bins (default 10 = deciles).
+    ax : plt.Axes or None
+        Axes to plot on; created if None.
+    title : str
+        Plot title.
+    save_path : str, Path, or None
+        If provided, save figure to this path.
+
+    Returns
+    -------
+    plt.Axes
+    """
+    if ax is None:
+        _, ax = plt.subplots(figsize=(8, 5))
+    order = np.argsort(-uplift_scores)
+    y_s, t_s = y[order], treatment[order]
+    bin_size = max(1, len(y_s) // n_bins)
+    labels, uplifts = [], []
+    for i in range(n_bins):
+        start = i * bin_size
+        end = start + bin_size if i < n_bins - 1 else len(y_s)
+        yb, tb = y_s[start:end], t_s[start:end]
+        nt, nc = (tb == 1).sum(), (tb == 0).sum()
+        if nt == 0 or nc == 0:
+            uplifts.append(np.nan)
+        else:
+            uplifts.append(float(yb[tb == 0].mean() - yb[tb == 1].mean()))
+        labels.append(f"D{i + 1}")
+    # Color bars: positive green, negative red
+    colors = ["#2ca02c" if u >= 0 else "#d62728" for u in uplifts]
+    ax.bar(labels, uplifts, color=colors, edgecolor="white", linewidth=0.5)
+    ax.axhline(0, color="gray", linewidth=0.8, linestyle="--")
+    ax.set_xlabel("Decile (D1 = highest predicted uplift)")
+    ax.set_ylabel("Realised uplift (control − treated)")
+    ax.set_title(title)
+    set_axes_clear(ax, x_axis_at_zero=False)
+    plt.tight_layout()
+    if save_path is not None:
+        ax.figure.savefig(Path(save_path), bbox_inches="tight", dpi=150)
+    return ax
+
+
+# --- Test-set visualisations (prediction-only, no labels needed) -----------
+
+
+def plot_segment_counts(
+    segments: np.ndarray,
+    ax: plt.Axes | None = None,
+    as_percent: bool = True,
+    title: str = "Population segments",
+    save_path: str | Path | None = None,
+) -> plt.Axes:
+    """Bar chart of count or percentage per uplift segment.
+
+    Generic: works with any categorical segment array (e.g. from
+    :func:`assign_segments` or a SHAP-based segmentation).
+
+    Parameters
+    ----------
+    segments : np.ndarray of str
+        Segment label per observation (e.g. "Persuadables", "Sure Things", …).
+    ax : plt.Axes or None
+        Axes to plot on; created if None.
+    as_percent : bool
+        If True, plot percentage; otherwise raw counts.
+    title : str
+        Plot title.
+    save_path : str, Path, or None
+        If provided, save figure to this path.
+
+    Returns
+    -------
+    plt.Axes
+    """
+    if ax is None:
+        _, ax = plt.subplots(figsize=(7, 4))
+    # Fixed display order: Persuadables first, Do-Not-Disturb last
+    seg_order = ["Persuadables", "Sure Things", "Lost Causes", "Do-Not-Disturb"]
+    seg_series = pd.Series(segments)
+    counts = seg_series.value_counts()
+    vals = [counts.get(s, 0) for s in seg_order]
+    if as_percent:
+        total = max(1, len(segments))
+        vals = [v / total * 100 for v in vals]
+        ylabel = "% of population"
+    else:
+        ylabel = "Count"
+    seg_colors = ["#2ca02c", "#1f77b4", "#ff7f0e", "#d62728"]
+    bars = ax.bar(seg_order, vals, color=seg_colors, edgecolor="white", linewidth=0.5)
+    # Annotate each bar
+    for bar, v in zip(bars, vals):
+        fmt = f"{v:.1f}%" if as_percent else f"{int(v):,}"
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height() + max(vals) * 0.02,
+            fmt,
+            ha="center",
+            va="bottom",
+            fontsize=10,
+        )
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    set_axes_clear(ax, x_axis_at_zero=False)
+    plt.tight_layout()
+    if save_path is not None:
+        ax.figure.savefig(Path(save_path), bbox_inches="tight", dpi=150)
+    return ax
+
+
+def plot_uplift_by_segment(
+    segments: np.ndarray,
+    uplift_scores: np.ndarray,
+    ax: plt.Axes | None = None,
+    title: str = "Predicted uplift by segment",
+    save_path: str | Path | None = None,
+) -> plt.Axes:
+    """Box plot of predicted uplift (or any score) per segment.
+
+    Under formal segment definitions, Sure Things and Lost Causes have |uplift| ≤ ε
+    (≈ 0); Persuadables > 0, Do-Not-Disturb < 0. Generic: accepts any score + segments.
+
+    Parameters
+    ----------
+    segments : np.ndarray of str
+        Segment label per observation.
+    uplift_scores : np.ndarray
+        Predicted uplift (or any numeric score, e.g. SHAP value).
+    ax : plt.Axes or None
+        Axes to plot on; created if None.
+    title : str
+        Plot title.
+    save_path : str, Path, or None
+        If provided, save figure to this path.
+
+    Returns
+    -------
+    plt.Axes
+    """
+    if ax is None:
+        _, ax = plt.subplots(figsize=(7, 4))
+    seg_order = ["Persuadables", "Sure Things", "Lost Causes", "Do-Not-Disturb"]
+    seg_colors = ["#2ca02c", "#1f77b4", "#ff7f0e", "#d62728"]
+    data_per_seg = [uplift_scores[segments == s] for s in seg_order]
+    bp = ax.boxplot(
+        data_per_seg,
+        labels=seg_order,
+        patch_artist=True,
+        widths=0.5,
+        showfliers=False,
+    )
+    for patch, color in zip(bp["boxes"], seg_colors):
+        patch.set_facecolor(color)
+        patch.set_alpha(0.6)
+    ax.axhline(0, color="gray", linewidth=0.8, linestyle="--")
+    ax.set_ylabel("Predicted uplift (−CATE)")
+    ax.set_title(title)
+    set_axes_clear(ax, x_axis_at_zero=False)
+    plt.tight_layout()
+    if save_path is not None:
+        ax.figure.savefig(Path(save_path), bbox_inches="tight", dpi=150)
+    return ax
+
+
+def plot_cumulative_uplift_by_segment(
+    segments: np.ndarray,
+    uplift_scores: np.ndarray,
+    n_points: int = 100,
+    ax: plt.Axes | None = None,
+    title: str = "Cumulative predicted uplift by segment",
+    save_path: str | Path | None = None,
+) -> plt.Axes:
+    """Four curves: cumulative predicted uplift contribution by segment.
+
+    Segments follow formal definitions (Persuadables = positive uplift, etc.).
+    Sorts population by *uplift_scores* (descending). At each proportion
+    targeted x, computes the cumulative **sum** of predicted uplift in the
+    top x%, split by segment. The four curves show how much each segment
+    contributes as the targeting budget expands.
+
+    Generic: works with any score + segment arrays (e.g. SHAP-based).
+
+    Parameters
+    ----------
+    segments : np.ndarray of str
+        Segment label per observation.
+    uplift_scores : np.ndarray
+        Predicted uplift (higher = target first).
+    n_points : int
+        Number of evaluation points along proportion axis.
+    ax : plt.Axes or None
+        Axes to plot on; created if None.
+    title : str
+        Plot title.
+    save_path : str, Path, or None
+        If provided, save figure to this path.
+
+    Returns
+    -------
+    plt.Axes
+    """
+    if ax is None:
+        _, ax = plt.subplots(figsize=(8, 5))
+    seg_order = ["Persuadables", "Sure Things", "Lost Causes", "Do-Not-Disturb"]
+    seg_colors = ["#2ca02c", "#1f77b4", "#ff7f0e", "#d62728"]
+    # Sort by descending score
+    order = np.argsort(-uplift_scores)
+    scores_sorted = uplift_scores[order]
+    segs_sorted = segments[order]
+    n_total = len(scores_sorted)
+    fracs = np.linspace(0.01, 1.0, n_points)
+    # Build cumulative sums per segment
+    cum_by_seg = {s: np.zeros(n_points) for s in seg_order}
+    for i, frac in enumerate(fracs):
+        n = max(1, int(n_total * frac))
+        sc_slice = scores_sorted[:n]
+        seg_slice = segs_sorted[:n]
+        for s in seg_order:
+            mask = seg_slice == s
+            cum_by_seg[s][i] = float(sc_slice[mask].sum()) if mask.any() else 0.0
+    # Normalise by population size so y-axis is "mean cumulative uplift per person"
+    for s in seg_order:
+        cum_by_seg[s] /= max(1, n_total)
+    for s, color in zip(seg_order, seg_colors):
+        ax.plot(fracs, cum_by_seg[s], linewidth=2, label=s, color=color)
+    ax.set_xlabel("Proportion targeted (by predicted uplift)")
+    ax.set_ylabel("Cumulative predicted uplift (per person)")
+    ax.set_title(title)
+    ax.legend(loc="best", frameon=True)
+    set_axes_clear(ax, x_axis_at_zero=False)
+    plt.tight_layout()
+    if save_path is not None:
+        ax.figure.savefig(Path(save_path), bbox_inches="tight", dpi=150)
+    return ax
+
+
+def export_top_fraction(
+    member_ids: np.ndarray | pd.Series,
+    uplift_scores: np.ndarray,
+    fraction: float = 0.10,
+    out_path: str | Path = "top_n_members_outreach.csv",
+) -> pd.DataFrame:
+    """Export the top fraction of users by predicted uplift to CSV.
+
+    Generic: accepts any ID array and numeric score. Can be reused with
+    SHAP-based or business-metric scores later.
+
+    Parameters
+    ----------
+    member_ids : array-like
+        User identifiers (e.g. member_id from test features).
+    uplift_scores : np.ndarray
+        Predicted uplift (higher = more benefit, i.e. −CATE for churn).
+    fraction : float
+        Fraction of population to export (e.g. 0.10 for top 10%).
+    out_path : str or Path
+        File path for the output CSV.
+
+    Returns
+    -------
+    pd.DataFrame
+        The exported table (member_id, prioritization_score, rank), sorted
+        by rank ascending.
+    """
+    n = max(1, int(len(uplift_scores) * fraction))
+    order = np.argsort(-np.asarray(uplift_scores))[:n]
+    df = pd.DataFrame({
+        "member_id": np.asarray(member_ids)[order],
+        "prioritization_score": np.asarray(uplift_scores)[order],
+    })
+    df = df.sort_values("prioritization_score", ascending=False).reset_index(drop=True)
+    df["rank"] = np.arange(1, len(df) + 1)
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out_path, index=False)
+    return df
