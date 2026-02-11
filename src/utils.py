@@ -18,7 +18,8 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-from scipy.stats import chi2_contingency
+from scipy.stats import chi2_contingency, pearsonr
+from sklearn.linear_model import LinearRegression
 from sklearn.metrics.pairwise import cosine_similarity
 
 try:
@@ -36,6 +37,11 @@ try:
     from xgboost import XGBRegressor
 except Exception:
     LGBMRegressor = XGBRegressor = None  # type: ignore[misc, assignment]
+
+try:
+    import shap  # SHAP interpretability for tree-based uplift models
+except Exception:
+    shap = None  # type: ignore[misc, assignment]
 
 if TYPE_CHECKING:
     from sentence_transformers import SentenceTransformer as ST
@@ -1481,6 +1487,59 @@ def build_feature_matrix(
 # Model and metric helpers
 # ---------------------------------------------------------------------------
 
+# Base-key groups: used to branch on model family throughout the pipeline
+# (e.g. skip early stopping, choose SHAP explainer, etc.)
+TREE_BASE_KEYS = {"LGBM", "XGB"}
+LINEAR_BASE_KEYS = {"Ridge", "Lasso", "ElasticNet"}
+
+
+def _make_linear_learner(base_key: str, base_params: dict | None = None) -> object:
+    """Create a Pipeline(SimpleImputer → StandardScaler → linear model).
+
+    Linear models require NaN-free, standardised inputs.  The pipeline
+    handles both automatically so the rest of the code (CausalML fit/predict)
+    stays unchanged.
+
+    Parameters
+    ----------
+    base_key : str
+        One of 'Ridge', 'Lasso', 'ElasticNet'.
+    base_params : dict or None
+        Hyperparameters for the linear model (e.g. {'alpha': 1.0}).
+
+    Returns
+    -------
+    sklearn.pipeline.Pipeline
+        Imputer → Scaler → Linear model.
+    """
+    from sklearn.impute import SimpleImputer
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import StandardScaler
+
+    params = dict(base_params) if base_params else {}
+
+    if base_key == "Ridge":
+        from sklearn.linear_model import Ridge
+        model = Ridge(**params)
+    elif base_key == "Lasso":
+        from sklearn.linear_model import Lasso
+        # Lasso default max_iter may not converge; increase if not set
+        params.setdefault("max_iter", 10000)
+        model = Lasso(**params)
+    elif base_key == "ElasticNet":
+        from sklearn.linear_model import ElasticNet
+        params.setdefault("max_iter", 10000)
+        model = ElasticNet(**params)
+    else:
+        raise ValueError(f"Unknown linear base_key: {base_key}")
+
+    # SimpleImputer strategy="median" handles NaN; StandardScaler normalises
+    return Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler()),
+        ("model", model),
+    ])
+
 
 def make_lgbm():
     """Create a LightGBM regressor with default hyperparameters (S/T-learner base)."""
@@ -1751,7 +1810,15 @@ def predict_baseline_slearner(
     base_model = fitted_models[group_key]
     # CausalML *prepends* treatment as the first column: [T | X]
     X_control = np.hstack([np.zeros((n, 1)), X_arr])
-    return base_model.predict(X_control)
+    # LGBM was fitted with feature names (DataFrame); passing numpy triggers sklearn warning — suppress it
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="X does not have valid feature names",
+            category=UserWarning,
+            module="sklearn.utils.validation",
+        )
+        return base_model.predict(X_control)
 
 
 def build_model(
@@ -1771,9 +1838,9 @@ def build_model(
     meta_key : str
         One of 'S', 'T'.
     base_key : str
-        One of 'LGBM', 'XGB'.
+        One of 'LGBM', 'XGB', 'Ridge', 'Lasso', 'ElasticNet'.
     spw : float
-        scale_pos_weight for XGBoost (ignored for LGBM).
+        scale_pos_weight for XGBoost (ignored for other base learners).
     base_params : dict | None
         Optional extra kwargs for the base learner (max_depth, learning_rate, etc.).
         If None, defaults are used.
@@ -1785,7 +1852,10 @@ def build_model(
     if BaseSRegressor is None or BaseTRegressor is None:
         raise ImportError("causalml is not installed")
 
-    if base_params is None:
+    # Linear base learners: Pipeline(Imputer → Scaler → Model)
+    if base_key in LINEAR_BASE_KEYS:
+        learner = _make_linear_learner(base_key, base_params)
+    elif base_params is None:
         learner = make_lgbm() if base_key == "LGBM" else make_xgb(spw)
     else:
         if base_key == "LGBM":
@@ -2041,7 +2111,17 @@ def get_validation_qini_curves(
                 X_val = X_df.iloc[val_idx]
                 y_val = y[val_idx]
                 t_val = treatment[val_idx]
-                model = build_model(meta_key, base_key, scale_pos_weight)
+                base_params_curves: dict | None = None
+                if base_key == "XGB":
+                    best_n = _early_stopping_n_estimators_single(
+                        X_tr, y[train_idx], treatment[train_idx],
+                        base_params={},
+                        scale_pos_weight=scale_pos_weight,
+                        random_state=random_state,
+                        n_estimators_max=800,
+                    )
+                    base_params_curves = {"n_estimators": best_n}
+                model = build_model(meta_key, base_key, scale_pos_weight, base_params=base_params_curves)
                 model.fit(X_tr, treatment[train_idx], y[train_idx])
                 pred = model.predict(X_val)
                 raw_pred = np.asarray(pred).ravel()
@@ -2276,7 +2356,18 @@ def _run_uplift_cv_loop(
             n_val = len(val_idx)
             n_treated_val = int((t_val == 1).sum())
             n_control_val = int((t_val == 0).sum())
-            model = build_model(meta_key, base_key, scale_pos_weight)
+            # For XGB, apply early stopping so n_estimators is chosen by validation (same in all flows).
+            base_params_cv: dict | None = None
+            if base_key == "XGB":
+                best_n = _early_stopping_n_estimators_single(
+                    X_tr, y_tr, t_tr,
+                    base_params={},
+                    scale_pos_weight=scale_pos_weight,
+                    random_state=random_state,
+                    n_estimators_max=800,
+                )
+                base_params_cv = {"n_estimators": best_n}
+            model = build_model(meta_key, base_key, scale_pos_weight, base_params=base_params_cv)
             model.fit(X_tr, t_tr, y_tr)
             pred = model.predict(X_val)
             # CausalML predict returns CATE = E[Y|T=1] - E[Y|T=0].
@@ -2640,8 +2731,21 @@ def run_uplift_hp_grid_search(
                 y_tr, y_val = y[train_idx], y[val_idx]
                 t_tr, t_val = treatment[train_idx], treatment[val_idx]
 
+                # For XGB, set n_estimators via early stopping on this fold's train set (same in all flows).
+                params_fold = dict(params)
+                if base_key == "XGB":
+                    n_max = params_fold.get("n_estimators", 800)
+                    best_n = _early_stopping_n_estimators_single(
+                        X_tr, y_tr, t_tr,
+                        base_params=params_fold,
+                        scale_pos_weight=scale_pos_weight,
+                        random_state=random_state,
+                        n_estimators_max=n_max,
+                    )
+                    params_fold["n_estimators"] = best_n
+
                 model = build_model(
-                    meta_key, base_key, scale_pos_weight, base_params=params
+                    meta_key, base_key, scale_pos_weight, base_params=params_fold
                 )
                 model.fit(X_tr, t_tr, y_tr)
                 pred = model.predict(X_val)
@@ -2714,6 +2818,295 @@ def build_hp_grid_search_table(
     return summary
 
 
+def compute_early_stopping_n_estimators(
+    X: pd.DataFrame | np.ndarray,
+    y: np.ndarray,
+    treatment: np.ndarray,
+    base_params: dict,
+    scale_pos_weight: float = 1.0,
+    n_splits: int = 5,
+    random_state: int = RANDOM_STATE,
+    inner_val_frac: float = 0.2,
+    early_stopping_rounds: int = 15,
+    n_estimators_max: int = 800,
+) -> list[int]:
+    """Compute per-fold best iteration via early stopping for S-learner + XGBoost.
+
+    Uses the same CV splits as the grid search. Within each fold's training set,
+    an inner train/validation split is used so the base XGB is fit with
+    eval_set and early_stopping_rounds. Returns the list of best_iteration
+    per fold; the caller typically uses median(best_rounds) as n_estimators
+    when training the final model on 100% of the data.
+
+    Only supports S-learner with XGBoost (meta_key='S', base_key='XGB'). The
+    internal design matrix is [treatment_indicator | X] as in CausalML.
+
+    Parameters
+    ----------
+    X : pd.DataFrame or np.ndarray
+        Feature matrix (same as used for uplift CV).
+    y : np.ndarray
+        Binary outcome (churn 0/1).
+    treatment : np.ndarray
+        Treatment indicator (1 = treated, 0 = control).
+    base_params : dict
+        Base-learner hyperparameters (e.g. from grid search best). Must include
+        max_depth, learning_rate, etc. n_estimators is overridden by
+        n_estimators_max for the inner fits.
+    scale_pos_weight : float
+        Passed to XGBRegressor (for class balance).
+    n_splits : int
+        Number of CV folds (must match Section 5/6).
+    random_state : int
+        Seed for StratifiedKFold and inner train_test_split.
+    inner_val_frac : float
+        Fraction of each fold's training set used as validation for early stopping.
+    early_stopping_rounds : int
+        Stop if validation metric does not improve for this many rounds.
+    n_estimators_max : int
+        Maximum number of trees for the inner XGB fit.
+
+    Returns
+    -------
+    list[int]
+        One best_iteration per fold. Use e.g. int(np.median(result)) for final
+        n_estimators.
+    """
+    from sklearn.model_selection import StratifiedKFold, train_test_split
+
+    if XGBRegressor is None:
+        raise ImportError("xgboost is required for early stopping")
+    y_ = np.asarray(y, dtype=np.float64)
+    t_ = np.asarray(treatment, dtype=np.float64)
+    valid = np.isfinite(y_) & np.isin(t_, (0.0, 1.0)) & np.isin(y_, (0.0, 1.0))
+    if not np.all(valid):
+        X = X.loc[valid] if isinstance(X, pd.DataFrame) else X[valid]
+        y_ = np.asarray(y_[valid], dtype=np.float64)
+        t_ = np.asarray(t_[valid], dtype=np.float64)
+    y = (y_ > 0.5).astype(np.int64)
+    treatment = (t_ > 0.5).astype(np.int64)
+    X_df = pd.DataFrame(X) if not isinstance(X, pd.DataFrame) else X
+    X_arr = np.asarray(X_df, dtype=np.float64)
+    stratify = 2 * treatment + y
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    splits = list(skf.split(X_arr, stratify))
+    best_rounds: list[int] = []
+    params = dict(base_params)
+    params["n_estimators"] = n_estimators_max
+    for fold, (train_idx, _val_idx) in enumerate(splits):
+        X_tr_full = X_arr[train_idx]
+        y_tr_full = y[train_idx]
+        t_tr_full = treatment[train_idx]
+        stratify_inner = 2 * t_tr_full + y_tr_full
+        # Inner split: stratify only when every stratum has at least 2 samples
+        unique_inner, counts_inner = np.unique(stratify_inner, return_counts=True)
+        can_stratify_inner = np.all(counts_inner >= 2)
+        if can_stratify_inner:
+            train_inner_idx, val_inner_idx = train_test_split(
+                np.arange(len(train_idx)),
+                test_size=inner_val_frac,
+                stratify=stratify_inner,
+                random_state=random_state,
+            )
+        else:
+            train_inner_idx, val_inner_idx = train_test_split(
+                np.arange(len(train_idx)),
+                test_size=inner_val_frac,
+                random_state=random_state,
+            )
+        X_tr = X_tr_full[train_inner_idx]
+        y_tr = y_tr_full[train_inner_idx]
+        t_tr = t_tr_full[train_inner_idx]
+        X_val = X_tr_full[val_inner_idx]
+        y_val = y_tr_full[val_inner_idx]
+        t_val = t_tr_full[val_inner_idx]
+        w_tr = (t_tr == 1).astype(np.float64).reshape(-1, 1)
+        w_val = (t_val == 1).astype(np.float64).reshape(-1, 1)
+        X_tr_new = np.hstack([w_tr, X_tr])
+        X_val_new = np.hstack([w_val, X_val])
+        # XGBoost 2.x/3.x: early_stopping_rounds is a constructor arg, not fit()
+        xgb = XGBRegressor(
+            random_state=random_state,
+            scale_pos_weight=scale_pos_weight,
+            verbosity=0,
+            early_stopping_rounds=early_stopping_rounds,
+            **params,
+        )
+        xgb.fit(
+            X_tr_new,
+            y_tr,
+            eval_set=[(X_val_new, y_val)],
+            verbose=False,
+        )
+        best = getattr(xgb, "best_iteration", None) or getattr(
+            xgb, "best_ntree_limit", None
+        )
+        if best is not None:
+            best_rounds.append(int(best))
+        else:
+            best_rounds.append(n_estimators_max)
+    return best_rounds
+
+
+def _early_stopping_n_estimators_single(
+    X_tr: np.ndarray | pd.DataFrame,
+    y_tr: np.ndarray,
+    t_tr: np.ndarray,
+    base_params: dict,
+    scale_pos_weight: float,
+    random_state: int,
+    inner_val_frac: float = 0.2,
+    early_stopping_rounds: int = 15,
+    n_estimators_max: int | None = None,
+) -> int:
+    """Compute best n_estimators for a single training set via inner train/val early stopping.
+
+    Used whenever an S+XGB model is fitted (CV, grid search, final fit) so that
+    early stopping is applied consistently. Does one inner stratified split,
+    builds S-learner design matrix [treatment | X], fits XGB with eval_set,
+    returns best_iteration (or best_ntree_limit).
+
+    Parameters
+    ----------
+    X_tr : np.ndarray or pd.DataFrame
+        Training feature matrix for this fold/split.
+    y_tr, t_tr : np.ndarray
+        Training outcome and treatment.
+    base_params : dict
+        Base-learner hyperparameters. n_estimators is set to n_estimators_max
+        for the inner fit; other keys passed to XGBRegressor.
+    scale_pos_weight : float
+        Passed to XGBRegressor.
+    random_state : int
+        Seed for inner train_test_split.
+    inner_val_frac : float
+        Fraction of X_tr used as validation for early stopping.
+    early_stopping_rounds : int
+        Stop if validation metric does not improve for this many rounds.
+    n_estimators_max : int or None
+        Max trees for inner fit. If None, uses base_params.get("n_estimators", 800).
+
+    Returns
+    -------
+    int
+        Best iteration for this training set.
+    """
+    from sklearn.model_selection import train_test_split
+
+    if XGBRegressor is None:
+        raise ImportError("xgboost is required for early stopping")
+    X_arr = np.asarray(X_tr, dtype=np.float64)
+    n_max = n_estimators_max if n_estimators_max is not None else base_params.get("n_estimators", 800)
+    params = dict(base_params)
+    params["n_estimators"] = n_max
+    stratify_inner = 2 * t_tr + y_tr
+    # Stratification requires at least 2 samples per class in both splits
+    unique, counts = np.unique(stratify_inner, return_counts=True)
+    can_stratify = np.all(counts >= 2)
+    if can_stratify:
+        train_idx, val_idx = train_test_split(
+            np.arange(len(y_tr)),
+            test_size=inner_val_frac,
+            stratify=stratify_inner,
+            random_state=random_state,
+        )
+    else:
+        train_idx, val_idx = train_test_split(
+            np.arange(len(y_tr)),
+            test_size=inner_val_frac,
+            random_state=random_state,
+        )
+    X_tr_inner = X_arr[train_idx]
+    y_tr_inner = y_tr[train_idx]
+    t_tr_inner = t_tr[train_idx]
+    X_val_inner = X_arr[val_idx]
+    y_val_inner = y_tr[val_idx]
+    t_val_inner = t_tr[val_idx]
+    w_tr = (t_tr_inner == 1).astype(np.float64).reshape(-1, 1)
+    w_val = (t_val_inner == 1).astype(np.float64).reshape(-1, 1)
+    X_tr_new = np.hstack([w_tr, X_tr_inner])
+    X_val_new = np.hstack([w_val, X_val_inner])
+    # XGBoost 2.x/3.x: early_stopping_rounds is a constructor arg, not fit()
+    xgb = XGBRegressor(
+        random_state=random_state,
+        scale_pos_weight=scale_pos_weight,
+        verbosity=0,
+        early_stopping_rounds=early_stopping_rounds,
+        **params,
+    )
+    xgb.fit(
+        X_tr_new,
+        y_tr_inner,
+        eval_set=[(X_val_new, y_val_inner)],
+        verbose=False,
+    )
+    best = getattr(xgb, "best_iteration", None) or getattr(xgb, "best_ntree_limit", None)
+    return int(best) if best is not None else n_max
+
+
+def fit_final_slearner(
+    X: pd.DataFrame | np.ndarray,
+    y: np.ndarray,
+    treatment: np.ndarray,
+    meta_key: str,
+    base_key: str,
+    base_params: dict,
+    scale_pos_weight: float = 1.0,
+    n_splits: int = 5,
+    random_state: int = RANDOM_STATE,
+    early_stopping_rounds: int = 15,
+    inner_val_frac: float = 0.2,
+    n_estimators_max: int = 800,
+):
+    """Build and fit the final meta-learner on the full dataset, with early stopping for XGB.
+
+    For base_key == 'XGB', runs compute_early_stopping_n_estimators to get
+    per-fold best iterations, sets n_estimators = median(best_rounds), then
+    builds and fits. For linear models (Ridge/Lasso/ElasticNet) early
+    stopping is skipped — the Pipeline inside build_model handles NaN
+    imputation and standardisation automatically.
+
+    Parameters
+    ----------
+    X, y, treatment : feature matrix, outcome, treatment (same as elsewhere).
+    meta_key, base_key : e.g. 'S', 'XGB', 'Ridge', 'Lasso', 'ElasticNet'.
+    base_params : dict
+        Best hyperparameters from grid search (or defaults). Not mutated.
+    scale_pos_weight, n_splits, random_state : as in other flows.
+    early_stopping_rounds, inner_val_frac, n_estimators_max : passed to early stopping.
+
+    Returns
+    -------
+    Fitted CausalML meta-learner (e.g. BaseSRegressor).
+    """
+    base_params = dict(base_params)
+    # Early stopping only applies to XGB; linear models and LGBM skip this
+    if base_key == "XGB":
+        best_rounds = compute_early_stopping_n_estimators(
+            X, y, treatment,
+            base_params=base_params,
+            scale_pos_weight=scale_pos_weight,
+            n_splits=n_splits,
+            random_state=random_state,
+            inner_val_frac=inner_val_frac,
+            early_stopping_rounds=early_stopping_rounds,
+            n_estimators_max=n_estimators_max,
+        )
+        base_params["n_estimators"] = int(np.median(best_rounds))
+    model = build_model(meta_key, base_key, scale_pos_weight, base_params=base_params)
+    X_arr = np.asarray(X, dtype=np.float64) if not isinstance(X, np.ndarray) else X
+    # CausalML/LGBM can trigger "X does not have valid feature names" when design matrix is numpy
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="X does not have valid feature names",
+            category=UserWarning,
+            module="sklearn.utils.validation",
+        )
+        model.fit(X=X_arr, treatment=treatment, y=y)
+    return model
+
+
 def get_qini_curves_top_hp_combos(
     X: pd.DataFrame,
     y: np.ndarray,
@@ -2781,7 +3174,18 @@ def get_qini_curves_top_hp_combos(
                 X_val = X_df.iloc[val_idx]
                 y_val = y[val_idx]
                 t_val = treatment[val_idx]
-                model = build_model(meta_key, base_key, scale_pos_weight, base_params=params)
+                params_fold = dict(params)
+                if base_key == "XGB":
+                    n_max = params_fold.get("n_estimators", 800)
+                    best_n = _early_stopping_n_estimators_single(
+                        X_tr, y[train_idx], treatment[train_idx],
+                        base_params=params_fold,
+                        scale_pos_weight=scale_pos_weight,
+                        random_state=random_state,
+                        n_estimators_max=n_max,
+                    )
+                    params_fold["n_estimators"] = best_n
+                model = build_model(meta_key, base_key, scale_pos_weight, base_params=params_fold)
                 model.fit(X_tr, treatment[train_idx], y[train_idx])
                 pred = model.predict(X_val)
                 raw_pred = np.asarray(pred).ravel()
@@ -2958,6 +3362,214 @@ def plot_uplift_by_decile(
     if save_path is not None:
         ax.figure.savefig(Path(save_path), bbox_inches="tight", dpi=150)
     return ax
+
+
+def compute_train_holdout_uplift_data(
+    X: pd.DataFrame | np.ndarray,
+    y: np.ndarray,
+    treatment: np.ndarray,
+    meta_key: str,
+    base_key: str,
+    base_params: dict,
+    scale_pos_weight: float = 1.0,
+    train_frac: float = 0.8,
+    random_state: int = RANDOM_STATE,
+    n_points: int = 100,
+    **fit_final_kw: object,
+) -> dict:
+    """Split data into train/holdout (one stratified 80/20), fit on train, predict on both.
+
+    Use this to evaluate realised uplift on an unseen fold when test has no labels.
+    Fits a model on the train portion only, then computes uplift curves and decile
+    data for both train and holdout so you can plot train vs holdout.
+
+    Parameters
+    ----------
+    X : pd.DataFrame or np.ndarray
+        Feature matrix (same as for fit_final_slearner).
+    y : np.ndarray
+        Binary outcome (e.g. churn 0/1).
+    treatment : np.ndarray
+        Treatment indicator (1 = treated, 0 = control).
+    meta_key, base_key : str
+        Same as fit_final_slearner (e.g. "S", "LGBM").
+    base_params : dict
+        Hyperparameters for the base learner (e.g. BEST_HP from grid search).
+    scale_pos_weight : float
+        Passed to fit_final_slearner.
+    train_frac : float
+        Fraction used for training (default 0.8); holdout is 1 - train_frac.
+    random_state : int
+        For reproducible stratified split.
+    n_points : int
+        Number of points for uplift_curve (default 100).
+    **fit_final_kw : optional
+        Passed to fit_final_slearner (n_splits, early_stopping_rounds, etc.).
+
+    Returns
+    -------
+    dict with keys:
+        model_80 : fitted meta-learner on train portion
+        y_tr, treatment_tr, uplift_scores_tr : train portion labels and scores
+        y_ho, treatment_ho, uplift_scores_ho : holdout portion labels and scores
+        ks_tr, uplift_vals_tr : cumulative uplift curve (train)
+        ks_ho, uplift_vals_ho : cumulative uplift curve (holdout)
+    """
+    from sklearn.model_selection import StratifiedKFold
+
+    # One stratified split: use first fold of 5-fold so train ≈ 80%, holdout ≈ 20%
+    n_splits = max(2, int(round(1 / (1 - train_frac))))  # 5 for train_frac=0.8
+    stratify = 2 * np.asarray(treatment, dtype=np.int64) + np.asarray(y, dtype=np.int64)
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    splits = list(skf.split(X, stratify))
+    train_idx, holdout_idx = splits[0]
+
+    if isinstance(X, pd.DataFrame):
+        X_tr, X_ho = X.iloc[train_idx], X.iloc[holdout_idx]
+    else:
+        X_tr, X_ho = X[train_idx], X[holdout_idx]
+    y_tr = y[train_idx]
+    y_ho = y[holdout_idx]
+    treatment_tr = treatment[train_idx]
+    treatment_ho = treatment[holdout_idx]
+
+    # Fit on train portion only (same API as fit_final_slearner)
+    model_80 = fit_final_slearner(
+        X_tr, y_tr, treatment_tr,
+        meta_key=meta_key,
+        base_key=base_key,
+        base_params=dict(base_params),
+        scale_pos_weight=scale_pos_weight,
+        random_state=random_state,
+        **fit_final_kw,
+    )
+
+    # Predict CATE on both portions; uplift score = -CATE for churn (higher = better)
+    cate_tr = np.asarray(model_80.predict(X=np.asarray(X_tr), treatment=treatment_tr)).ravel()
+    cate_ho = np.asarray(model_80.predict(X=np.asarray(X_ho), treatment=treatment_ho)).ravel()
+    uplift_scores_tr = -cate_tr
+    uplift_scores_ho = -cate_ho
+
+    # Cumulative uplift curves
+    ks_tr, uplift_vals_tr = uplift_curve(y_tr, treatment_tr, uplift_scores_tr, n_points=n_points)
+    ks_ho, uplift_vals_ho = uplift_curve(y_ho, treatment_ho, uplift_scores_ho, n_points=n_points)
+
+    return {
+        "model_80": model_80,
+        "y_tr": y_tr,
+        "treatment_tr": treatment_tr,
+        "uplift_scores_tr": uplift_scores_tr,
+        "y_ho": y_ho,
+        "treatment_ho": treatment_ho,
+        "uplift_scores_ho": uplift_scores_ho,
+        "ks_tr": ks_tr,
+        "uplift_vals_tr": uplift_vals_tr,
+        "ks_ho": ks_ho,
+        "uplift_vals_ho": uplift_vals_ho,
+    }
+
+
+def plot_cumulative_uplift_curve_train_holdout(
+    ks_tr: np.ndarray,
+    uplift_vals_tr: np.ndarray,
+    ks_ho: np.ndarray,
+    uplift_vals_ho: np.ndarray,
+    label_train: str = "Train (80%)",
+    label_holdout: str = "Holdout (20%)",
+    title: str = "Cumulative uplift curve — train vs holdout",
+    ax: plt.Axes | None = None,
+    save_path: str | Path | None = None,
+) -> plt.Axes:
+    """Plot cumulative realised uplift for train and holdout on the same axes.
+
+    Use with outputs from :func:`compute_train_holdout_uplift_data`. Draws two
+    lines (train and holdout) so you can compare generalization.
+
+    Parameters
+    ----------
+    ks_tr, uplift_vals_tr : np.ndarray
+        From uplift_curve on train portion.
+    ks_ho, uplift_vals_ho : np.ndarray
+        From uplift_curve on holdout portion.
+    label_train, label_holdout : str
+        Legend labels.
+    title : str
+        Plot title.
+    ax : plt.Axes or None
+        Axes to plot on; created if None.
+    save_path : str, Path, or None
+        If set, save figure.
+
+    Returns
+    -------
+    plt.Axes
+    """
+    if ax is None:
+        _, ax = plt.subplots(figsize=(8, 5))
+    valid_tr = ~np.isnan(uplift_vals_tr)
+    valid_ho = ~np.isnan(uplift_vals_ho)
+    ax.plot(ks_tr[valid_tr], uplift_vals_tr[valid_tr], linewidth=2, label=label_train, color="#1f77b4")
+    ax.plot(ks_ho[valid_ho], uplift_vals_ho[valid_ho], linewidth=2, label=label_holdout, color="#ff7f0e")
+    if valid_tr.sum() > 0:
+        overall_tr = uplift_vals_tr[valid_tr][-1]
+        ax.axhline(overall_tr, linestyle="--", color="gray", linewidth=1, alpha=0.7, label="Random baseline")
+    ax.set_xlabel("Proportion targeted")
+    ax.set_ylabel("Realised uplift (control − treated)")
+    ax.set_title(title)
+    ax.legend(loc="best", frameon=True)
+    set_axes_clear(ax, x_axis_at_zero=False)
+    plt.tight_layout()
+    if save_path is not None:
+        ax.figure.savefig(Path(save_path), bbox_inches="tight", dpi=150)
+    return ax
+
+
+def plot_uplift_by_decile_train_holdout(
+    y_tr: np.ndarray,
+    treatment_tr: np.ndarray,
+    uplift_scores_tr: np.ndarray,
+    y_ho: np.ndarray,
+    treatment_ho: np.ndarray,
+    uplift_scores_ho: np.ndarray,
+    label_train: str = "Train (80%)",
+    label_holdout: str = "Holdout (20%)",
+    title: str = "Realised uplift by decile — train vs holdout",
+    n_bins: int = 10,
+    save_path: str | Path | None = None,
+) -> tuple[plt.Figure, plt.Axes]:
+    """Two side-by-side decile bar charts (train and holdout) for comparison.
+
+    Use with outputs from :func:`compute_train_holdout_uplift_data`. Each panel
+    shows realised uplift per decile; compare to see if ranking generalizes.
+
+    Parameters
+    ----------
+    y_tr, treatment_tr, uplift_scores_tr : np.ndarray
+        Train portion labels, treatment, and uplift scores.
+    y_ho, treatment_ho, uplift_scores_ho : np.ndarray
+        Holdout portion labels, treatment, and uplift scores.
+    label_train, label_holdout : str
+        Subplot titles.
+    title : str
+        Figure suptitle.
+    n_bins : int
+        Number of bins (default 10 = deciles).
+    save_path : str, Path, or None
+        If set, save figure.
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+    ax1, ax2 : matplotlib.axes.Axes
+    """
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+    plot_uplift_by_decile(y_tr, treatment_tr, uplift_scores_tr, n_bins=n_bins, ax=ax1, title=label_train)
+    plot_uplift_by_decile(y_ho, treatment_ho, uplift_scores_ho, n_bins=n_bins, ax=ax2, title=label_holdout)
+    fig.suptitle(title, fontsize=12, y=1.02)
+    plt.tight_layout()
+    if save_path is not None:
+        fig.savefig(Path(save_path), bbox_inches="tight", dpi=150)
+    return fig, (ax1, ax2)
 
 
 # --- Test-set visualisations (prediction-only, no labels needed) -----------
@@ -3193,3 +3805,1019 @@ def export_top_fraction(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(out_path, index=False)
     return df
+
+
+# ===========================================================================
+# Section 8 — SHAP interpretability helpers
+# ===========================================================================
+
+
+def make_nan_free(
+    X: np.ndarray | pd.DataFrame,
+    reference: np.ndarray | pd.DataFrame | None = None,
+) -> np.ndarray:
+    """Return a NaN-free copy of *X* by imputing missing values with column medians.
+
+    Tree-based models handle NaNs natively, but SHAP's TreeExplainer can
+    produce NaN SHAP values when the input contains NaNs.  This helper
+    replaces every NaN with the **median** of that column (computed from
+    *reference* if given, else from *X* itself).
+
+    Parameters
+    ----------
+    X : np.ndarray or pd.DataFrame
+        Feature matrix that may contain NaN values.
+    reference : np.ndarray or pd.DataFrame or None
+        Reference dataset for computing column medians (e.g. training
+        data).  If ``None``, medians are computed from *X* itself.
+
+    Returns
+    -------
+    np.ndarray
+        Copy of *X* with NaNs replaced by column medians.
+    """
+    X_arr = np.asarray(X, dtype=float).copy()
+    ref = np.asarray(reference, dtype=float) if reference is not None else X_arr
+    # Compute column-wise median ignoring NaNs
+    medians = np.nanmedian(ref, axis=0)
+    # Replace NaNs in each column with the corresponding median
+    for col_idx in range(X_arr.shape[1]):
+        nan_mask = np.isnan(X_arr[:, col_idx])
+        if nan_mask.any():
+            X_arr[nan_mask, col_idx] = medians[col_idx]
+    return X_arr
+
+
+def extract_slearner_base_model(model):
+    """Extract the fitted base model from a CausalML S-Learner.
+
+    CausalML's ``BaseSLearner.fit()`` stores fitted models in
+    ``self.models`` — a dict keyed by treatment group.  For binary
+    treatment there is exactly one key (typically 1).
+
+    Parameters
+    ----------
+    model : BaseSRegressor (fitted)
+        A fitted CausalML S-Learner.
+
+    Returns
+    -------
+    object
+        The fitted base estimator (e.g. XGBRegressor).
+    """
+    fitted_models = getattr(model, "models", None)
+    if fitted_models is None or len(fitted_models) == 0:
+        raise AttributeError(
+            "Cannot find fitted internal models on the S-Learner. "
+            "Expected attribute 'models' (dict). Has fit() been called?"
+        )
+    group_key = next(iter(fitted_models))
+    return fitted_models[group_key]
+
+
+def _fix_xgboost_base_score_for_shap(base_model) -> None:
+    """Fix XGBoost 3.1+ base_score format so SHAP TreeExplainer can parse the model.
+
+    XGBoost 3.1+ stores base_score as a string like '[5E-1]' in the saved JSON.
+    SHAP's TreeExplainer does float(learner_model_param[\"base_score\"]) and fails.
+    This helper saves the booster to JSON, converts base_score to a float, reloads,
+    so that the in-memory model is unchanged for prediction but SHAP can read it.
+
+    Modifies the booster in place. No-op if the model is not XGBoost or has no
+    get_booster(), or if saving/loading is not supported.
+
+    Parameters
+    ----------
+    base_model : object
+        Fitted model (e.g. XGBRegressor) that may have a get_booster().
+
+    Returns
+    -------
+    None
+    """
+    import json
+    import tempfile
+
+    try:
+        booster = base_model.get_booster()
+    except Exception:
+        return
+
+    def fix_base_score_in_dict(obj: dict) -> bool:
+        """Recursively fix 'base_score' values so float(...) works (e.g. '[5E-1]' -> '5E-1')."""
+        changed = False
+        for key, val in list(obj.items()):
+            if key == "base_score":
+                if isinstance(val, str) and ("[" in val or "]" in val):
+                    s = val.strip("[]")
+                    try:
+                        float(s)  # ensure it parses
+                        obj[key] = s
+                        changed = True
+                    except ValueError:
+                        pass
+                elif isinstance(val, list) and len(val) > 0:
+                    v0 = val[0]
+                    if isinstance(v0, (int, float)):
+                        obj[key] = str(v0)
+                        changed = True
+                    elif isinstance(v0, str):
+                        s = v0.strip("[]")
+                        try:
+                            float(s)
+                            obj[key] = s
+                            changed = True
+                        except ValueError:
+                            pass
+            elif isinstance(val, dict):
+                changed = fix_base_score_in_dict(val) or changed
+            elif isinstance(val, list) and val and isinstance(val[0], dict):
+                for item in val:
+                    changed = fix_base_score_in_dict(item) or changed
+        return changed
+
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            tmp_path = f.name
+        booster.save_model(tmp_path)
+        try:
+            with open(tmp_path, encoding="utf-8") as f:
+                config = json.load(f)
+            if fix_base_score_in_dict(config):
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    json.dump(config, f, indent=2)
+                booster.load_model(tmp_path)
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _is_pipeline_linear(base_model) -> bool:
+    """Check if a base model is a sklearn Pipeline ending with a linear model."""
+    from sklearn.pipeline import Pipeline
+    if isinstance(base_model, Pipeline):
+        final_step = base_model.steps[-1][1]
+        from sklearn.linear_model import Ridge, Lasso, ElasticNet, LinearRegression
+        return isinstance(final_step, (Ridge, Lasso, ElasticNet, LinearRegression))
+    return False
+
+
+def _make_shap_explainer_for_base(base_model, X_background: np.ndarray):
+    """Create the appropriate SHAP explainer for the given base model.
+
+    For tree models (LGBM, XGBoost): uses TreeExplainer.
+    For linear Pipelines (Ridge/Lasso/ElasticNet): transforms background
+    data through the Pipeline's preprocessing steps, then uses
+    LinearExplainer on the final linear model.
+
+    Parameters
+    ----------
+    base_model : fitted sklearn estimator or Pipeline
+        The internal base model from CausalML S-learner.
+    X_background : np.ndarray
+        Background data for the explainer (augmented with treatment column).
+
+    Returns
+    -------
+    explainer : shap.Explainer
+        A SHAP explainer appropriate for the model type.
+    """
+    if _is_pipeline_linear(base_model):
+        # Transform background through imputer + scaler, then explain the linear model
+        from sklearn.pipeline import Pipeline
+        preprocessing = Pipeline(base_model.steps[:-1])
+        X_bg_transformed = preprocessing.transform(X_background)
+        linear_model = base_model.steps[-1][1]
+        return shap.LinearExplainer(linear_model, X_bg_transformed)
+    else:
+        # Tree model: use TreeExplainer with XGBoost base_score fix
+        _fix_xgboost_base_score_for_shap(base_model)
+        _real_float = float
+
+        def _float_for_shap(x):
+            """Allow float() to accept XGBoost 3.1+ base_score strings like '[5E-1]'."""
+            if isinstance(x, str):
+                x = x.strip().strip("[]")
+            if isinstance(x, list) and len(x) > 0:
+                x = x[0]
+            return _real_float(x)
+
+        import builtins
+        try:
+            builtins.float = _float_for_shap
+            try:
+                explainer = shap.TreeExplainer(base_model)
+            finally:
+                builtins.float = _real_float
+        except ValueError as e:
+            builtins.float = _real_float
+            if "could not convert string to float" in str(e) and "base_score" in str(e).lower():
+                _fix_xgboost_base_score_for_shap(base_model)
+                builtins.float = _float_for_shap
+                try:
+                    explainer = shap.TreeExplainer(base_model)
+                finally:
+                    builtins.float = _real_float
+            else:
+                raise
+        return explainer
+
+
+def _shap_explain(explainer, base_model, X_data: np.ndarray) -> object:
+    """Run SHAP explanation, handling Pipeline preprocessing if needed.
+
+    For linear Pipelines: transforms X through preprocessing before explaining.
+    For tree models: passes X directly.
+
+    Parameters
+    ----------
+    explainer : shap.Explainer
+    base_model : fitted base model (Pipeline or tree)
+    X_data : np.ndarray
+        Augmented data [T | X].
+
+    Returns
+    -------
+    SHAP explanation object or array.
+    """
+    if _is_pipeline_linear(base_model):
+        from sklearn.pipeline import Pipeline
+        preprocessing = Pipeline(base_model.steps[:-1])
+        X_transformed = preprocessing.transform(X_data)
+        return explainer(X_transformed)
+    else:
+        return explainer(X_data)
+
+
+def compute_shap_uplift_slearner(
+    model,
+    X: np.ndarray | pd.DataFrame,
+    feature_names: list[str] | None = None,
+    reference_X: np.ndarray | pd.DataFrame | None = None,
+) -> tuple:
+    """Compute per-feature SHAP values for the **uplift** (−CATE) of an S-Learner.
+
+    The S-Learner's internal model predicts ``E[Y | X, T]`` with
+    treatment prepended as the first column.  To decompose the *uplift*
+    into per-feature contributions we:
+
+    1. Run SHAP explainer with ``T = 1`` for every row → ``shap_t1``.
+    2. Run SHAP explainer with ``T = 0`` for every row → ``shap_t0``.
+    3. ``shap_uplift = shap_t0[:, 1:] − shap_t1[:, 1:]``
+       (feature columns only, negated for −CATE = retention uplift).
+
+    Supports both tree-based (LGBM, XGB → TreeExplainer) and linear
+    (Ridge/Lasso/ElasticNet Pipeline → LinearExplainer) base models.
+
+    A positive SHAP value for a feature means *that feature pushes the
+    uplift higher for this user* (more beneficial treatment effect).
+
+    NaN handling: *X* is passed through ``make_nan_free`` (median impute)
+    using *reference_X* (or *X* itself) before computing SHAP, because
+    SHAP TreeExplainer can produce NaN SHAP values on NaN inputs.
+
+    Parameters
+    ----------
+    model : BaseSRegressor (fitted)
+        A fitted CausalML S-Learner.
+    X : np.ndarray or pd.DataFrame
+        Feature matrix (same columns as used in fit, **without** treatment).
+    feature_names : list[str] or None
+        Names for the features (columns of *X*).  If ``None``, uses
+        generic ``["f0", "f1", ...]``.
+    reference_X : np.ndarray or pd.DataFrame or None
+        Reference data for NaN imputation medians (e.g. full training set).
+        If ``None``, medians are computed from *X*.
+
+    Returns
+    -------
+    shap_values_matrix : np.ndarray, shape (n_samples, n_features)
+        Per-feature SHAP values for the retention uplift (−CATE).
+    feature_names : list[str]
+        Feature names aligned with columns of *shap_values_matrix*.
+    expected_uplift : float
+        Baseline expected uplift (difference of base values).
+    """
+    if shap is None:
+        raise ImportError("shap package is required. Install with: pip install shap")
+
+    base_model = extract_slearner_base_model(model)
+    X_clean = make_nan_free(X, reference=reference_X)
+    n = X_clean.shape[0]
+
+    # Build augmented matrices: [T | X]
+    X_t1 = np.hstack([np.ones((n, 1)), X_clean])   # treatment = 1
+    X_t0 = np.hstack([np.zeros((n, 1)), X_clean])   # treatment = 0
+
+    # Create appropriate SHAP explainer (tree or linear) using T=0 background
+    explainer = _make_shap_explainer_for_base(base_model, X_t0)
+
+    # Run SHAP on both treatment conditions
+    shap_t1 = _shap_explain(explainer, base_model, X_t1)
+    shap_t0 = _shap_explain(explainer, base_model, X_t0)
+
+    # Handle both Explanation object (.values) and raw array (newer vs older SHAP API)
+    vals_t1 = getattr(shap_t1, "values", shap_t1)
+    vals_t0 = getattr(shap_t0, "values", shap_t0)
+    vals_t1 = np.asarray(vals_t1).squeeze()
+    vals_t0 = np.asarray(vals_t0).squeeze()
+    # Ensure 2D: (n_samples, n_features) — drop any trailing class dimension from multiclass
+    if vals_t1.ndim > 2:
+        vals_t1 = vals_t1.reshape(vals_t1.shape[0], -1)
+    if vals_t0.ndim > 2:
+        vals_t0 = vals_t0.reshape(vals_t0.shape[0], -1)
+
+    # Uplift SHAP = SHAP(T=0) − SHAP(T=1) for feature columns (skip col 0 = treatment)
+    # This is because uplift = −CATE = E[Y|T=0] − E[Y|T=1], so higher = more beneficial.
+    uplift_shap = vals_t0[:, 1:] - vals_t1[:, 1:]
+
+    # Expected uplift (base value difference)
+    base_t1 = getattr(shap_t1, "base_values", np.array(0.0))
+    base_t0 = getattr(shap_t0, "base_values", np.array(0.0))
+    base_t1 = np.asarray(base_t1).ravel()
+    base_t0 = np.asarray(base_t0).ravel()
+    expected_uplift = float(np.mean(base_t0) - np.mean(base_t1))
+
+    if feature_names is None:
+        feature_names = [f"f{i}" for i in range(X_clean.shape[1])]
+
+    return uplift_shap, list(feature_names), expected_uplift
+
+
+def plot_shap_importance_bar(
+    shap_values: np.ndarray,
+    feature_names: list[str],
+    title: str = "Feature importance for predicted uplift (mean |SHAP|)",
+    top_n: int | None = None,
+    figsize: tuple = (8, 5),
+    color: str = "#1f77b4",
+) -> None:
+    """Horizontal bar chart of mean absolute SHAP values (global feature importance).
+
+    Parameters
+    ----------
+    shap_values : np.ndarray, shape (n_samples, n_features)
+        SHAP values matrix (e.g. from ``compute_shap_uplift_slearner``).
+    feature_names : list[str]
+        Feature names aligned with columns of *shap_values*.
+    title : str
+        Plot title.
+    top_n : int or None
+        Show only the top *n* features.  ``None`` shows all.
+    figsize : tuple
+        Figure size.
+    color : str
+        Bar color.
+
+    Returns
+    -------
+    None
+        Displays the plot.
+    """
+    # Ensure 2D array (squeeze in case of (n, f, 1) from some SHAP versions)
+    shap_values = np.asarray(shap_values).squeeze()
+    if shap_values.ndim == 1:
+        shap_values = shap_values.reshape(1, -1)
+    if shap_values.ndim > 2:
+        shap_values = shap_values.reshape(shap_values.shape[0], -1)
+
+    n_features = shap_values.shape[1]
+    # Align feature names: use only as many as we have columns
+    names = list(feature_names)[:n_features]
+    if len(names) < n_features:
+        names = names + [f"f{i}" for i in range(len(names), n_features)]
+
+    # Mean absolute SHAP value per feature
+    mean_abs = np.abs(shap_values).mean(axis=0)
+    order = np.argsort(mean_abs)  # ascending for horizontal bar
+    if top_n is not None:
+        order = order[-top_n:]
+
+    sorted_names = [names[i] for i in order]
+    sorted_vals = np.asarray(mean_abs[order]).ravel()
+
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.barh(sorted_names, sorted_vals, color=color)
+    ax.set_xlabel("Mean |SHAP value|")
+    ax.set_title(title, fontsize=13, fontweight="bold")
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    fig.tight_layout()
+
+
+def plot_shap_beeswarm(
+    shap_values: np.ndarray,
+    X_display: np.ndarray | pd.DataFrame,
+    feature_names: list[str],
+    title: str = "SHAP beeswarm — feature effects on predicted uplift",
+    figsize: tuple = (9, 6),
+) -> None:
+    """Beeswarm plot showing per-observation SHAP values coloured by feature value.
+
+    Each dot is one observation; horizontal position is the SHAP value
+    (positive → pushes uplift higher); colour represents the feature value
+    (red = high, blue = low).
+
+    Parameters
+    ----------
+    shap_values : np.ndarray, shape (n_samples, n_features)
+        SHAP values matrix.
+    X_display : np.ndarray or pd.DataFrame
+        The original (NaN-free) feature values used for colouring the dots.
+    feature_names : list[str]
+        Feature names aligned with columns of *shap_values*.
+    title : str
+        Plot title.
+    figsize : tuple
+        Figure size.
+
+    Returns
+    -------
+    None
+        Displays the plot.
+    """
+    if shap is None:
+        raise ImportError("shap package is required.")
+
+    # Build an Explanation object so shap.plots.beeswarm can render it
+    explanation = shap.Explanation(
+        values=shap_values,
+        data=np.asarray(X_display),
+        feature_names=feature_names,
+    )
+    plt.figure(figsize=figsize)
+    plt.title(title, fontsize=13, fontweight="bold")
+    shap.plots.beeswarm(explanation, show=False, max_display=len(feature_names))
+    plt.tight_layout()
+
+
+def _partial_corr_one(
+    x_j: np.ndarray,
+    y: np.ndarray,
+    X_other: np.ndarray,
+) -> float:
+    """Partial correlation of x_j with y controlling for X_other (residual approach).
+
+    Returns 0.0 when x_j or residuals have zero variance (correlation undefined).
+    """
+    # If x_j has zero variance (e.g. constant SHAP), correlation is undefined → 0.0
+    if np.nanstd(x_j) < 1e-12:
+        return 0.0
+    if X_other.size == 0 or X_other.shape[1] == 0:
+        r, _ = pearsonr(x_j, y)
+        return float(r) if (r is not None and np.isfinite(r)) else 0.0
+    reg = LinearRegression().fit(X_other, x_j)
+    r_j = x_j - reg.predict(X_other)
+    reg_y = LinearRegression().fit(X_other, y)
+    r_y = y - reg_y.predict(X_other)
+    # If residuals have zero variance after partialing out, correlation is undefined → 0.0
+    if np.nanstd(r_j) < 1e-12 or np.nanstd(r_y) < 1e-12:
+        return 0.0
+    r, _ = pearsonr(r_j, r_y)
+    return float(r) if (r is not None and np.isfinite(r)) else 0.0
+
+
+def compute_parshap_overfitting(
+    model,
+    X: np.ndarray | pd.DataFrame,
+    y: np.ndarray,
+    treatment: np.ndarray,
+    feature_names: list[str],
+    train_frac: float = 0.8,
+    random_state: int = RANDOM_STATE,
+    reference_X: np.ndarray | pd.DataFrame | None = None,
+) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    """Compute partial correlation of SHAP with real outcome on train vs holdout.
+
+    ParSHAP requires **real labels** on both splits to detect overfitting.
+    This function splits the labelled data (X, y, treatment) into train
+    (train_frac) and holdout (1 - train_frac), fits a **clone** of the
+    model on the train portion, computes SHAP on both splits using that
+    clone, then measures partial correlation of each feature's SHAP values
+    with the real outcome y (controlling for other SHAP columns).
+
+    Features whose partial correlation is much higher on train than on
+    holdout are candidates for overfitting (they help explain the target
+    in-sample but not out-of-sample).  The scatter plot (see
+    ``plot_parshap_overfitting``) puts train on x and holdout on y;
+    points below the diagonal indicate potential overfitting.
+
+    Parameters
+    ----------
+    model : BaseSRegressor (fitted or template)
+        S-learner.  A deep copy is fit on the train fraction.
+    X : np.ndarray or pd.DataFrame
+        Full labelled feature matrix.
+    y : np.ndarray
+        Binary outcome (churn 0/1).
+    treatment : np.ndarray
+        Treatment indicator (0/1).
+    feature_names : list[str]
+        Names for the feature columns.
+    train_frac : float
+        Fraction of labelled data used for training the clone
+        (rest = holdout for comparison).
+    random_state : int
+        Seed for train/holdout split (stratified by 2*treatment + y).
+    reference_X : np.ndarray or pd.DataFrame or None
+        Reference for NaN imputation when computing SHAP.  If None,
+        uses the full X.
+
+    Returns
+    -------
+    par_train : np.ndarray, shape (n_features,)
+        Partial correlation of each feature's SHAP with real y on train.
+    par_holdout : np.ndarray, shape (n_features,)
+        Same on holdout (real y, not predicted).
+    feature_names : list[str]
+        Feature names for plotting.
+    """
+    from copy import deepcopy
+    from sklearn.model_selection import train_test_split
+
+    X_arr = np.asarray(X, dtype=np.float64)
+    if reference_X is None:
+        reference_X = X_arr
+    # Stratified split of labelled data into train / holdout
+    stratify = 2 * np.asarray(treatment).ravel() + np.asarray(y).ravel()
+    train_idx, hold_idx = train_test_split(
+        np.arange(len(y)),
+        train_size=train_frac,
+        stratify=stratify,
+        random_state=random_state,
+    )
+    X_tr = X_arr[train_idx]
+    y_tr = np.asarray(y).ravel()[train_idx]
+    t_tr = np.asarray(treatment).ravel()[train_idx]
+    X_ho = X_arr[hold_idx]
+    y_ho = np.asarray(y).ravel()[hold_idx]
+    # Fit a clone on train only (same hyper-params, fresh fit)
+    model_clone = deepcopy(model)
+    model_clone.fit(X_tr, t_tr, y_tr)
+    # Compute SHAP on train and holdout using the clone
+    shap_tr, _, _ = compute_shap_uplift_slearner(
+        model_clone, X_tr, feature_names=feature_names, reference_X=reference_X
+    )
+    shap_ho, _, _ = compute_shap_uplift_slearner(
+        model_clone, X_ho, feature_names=feature_names, reference_X=reference_X
+    )
+    shap_tr = np.asarray(shap_tr).squeeze()
+    shap_ho = np.asarray(shap_ho).squeeze()
+    if shap_tr.ndim == 1:
+        shap_tr = shap_tr.reshape(-1, 1)
+    if shap_ho.ndim == 1:
+        shap_ho = shap_ho.reshape(-1, 1)
+    n_features = shap_tr.shape[1]
+    par_train = np.zeros(n_features)
+    par_holdout = np.zeros(n_features)
+    for j in range(n_features):
+        other_idx = [i for i in range(n_features) if i != j]
+        X_other_tr = shap_tr[:, other_idx] if other_idx else np.empty((shap_tr.shape[0], 0))
+        X_other_ho = shap_ho[:, other_idx] if other_idx else np.empty((shap_ho.shape[0], 0))
+        par_train[j] = _partial_corr_one(shap_tr[:, j], y_tr, X_other_tr)
+        par_holdout[j] = _partial_corr_one(shap_ho[:, j], y_ho, X_other_ho)
+    par_train = np.asarray(par_train)
+    par_holdout = np.asarray(par_holdout)
+    names_out = list(feature_names)[:n_features]
+    return par_train, par_holdout, names_out
+
+
+def plot_parshap_overfitting(
+    par_train: np.ndarray,
+    par_holdout: np.ndarray,
+    feature_names: list[str],
+    title: str = "ParSHAP: partial corr. of SHAP with target (train vs holdout)",
+    figsize: tuple = (8, 8),
+    save_path: str | Path | None = None,
+) -> None:
+    """Scatter plot of partial correlation on train (x) vs holdout (y) per feature.
+
+    Each point is one feature.  The diagonal y=x means perfect consistency
+    between in-sample and out-of-sample.  Points **below** the diagonal
+    (train > holdout) suggest the feature's SHAP-target link is stronger
+    in-sample → potential overfitting.  Points on or above the diagonal
+    are well-generalising.  Colour encodes the overfitting gap
+    (train − holdout): **red = more overfitting**, **green = consistent**.
+    A colorbar legend is displayed.
+
+    Parameters
+    ----------
+    par_train : np.ndarray, shape (n_features,)
+        Partial correlation of each feature's SHAP with real outcome on
+        the train split.
+    par_holdout : np.ndarray, shape (n_features,)
+        Same on the holdout split (real outcome, not predicted).
+    feature_names : list[str]
+        Feature names aligned with par_train / par_holdout.
+    title : str
+        Plot title.
+    figsize : tuple
+        Figure size (square recommended).
+    save_path : str or Path or None
+        If set, save the figure to this path.
+    """
+    from matplotlib.colors import Normalize  # local import to avoid top-level dep
+
+    par_train = np.asarray(par_train).ravel()
+    par_holdout = np.asarray(par_holdout).ravel()
+    n = len(par_train)
+    feature_names = list(feature_names)[:n]
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    # Overfitting gap: positive = train stronger than holdout = potential overfitting
+    diffs = par_train - par_holdout
+    cmap = plt.cm.RdYlGn_r          # red = high diff (overfitting), green = low
+    norm = Normalize(vmin=diffs.min(), vmax=diffs.max())
+
+    scatter = ax.scatter(
+        par_train, par_holdout, c=diffs, cmap=cmap, norm=norm,
+        s=90, edgecolors="black", linewidths=0.5, zorder=3,
+    )
+
+    # Annotate each feature with smart offset to reduce overlap
+    for i, name in enumerate(feature_names):
+        ax.annotate(
+            name, (par_train[i], par_holdout[i]),
+            xytext=(6, 6), textcoords="offset points", fontsize=8.5,
+            bbox=dict(boxstyle="round,pad=0.15", fc="white", alpha=0.7, lw=0),
+        )
+
+    # Axis range (square, symmetric around the data)
+    lim_lo = min(par_train.min(), par_holdout.min()) - 0.03
+    lim_hi = max(par_train.max(), par_holdout.max()) + 0.03
+    ax.set_xlim(lim_lo, lim_hi)
+    ax.set_ylim(lim_lo, lim_hi)
+
+    # Reference lines
+    ax.axhline(0, color="gray", linewidth=0.7, linestyle="-")
+    ax.axvline(0, color="gray", linewidth=0.7, linestyle="-")
+    ax.plot([lim_lo, lim_hi], [lim_lo, lim_hi], "k--", linewidth=1,
+            label="y = x (no overfitting)")
+
+    ax.set_xlabel("Partial corr. (SHAP vs target) — Train split", fontsize=11)
+    ax.set_ylabel("Partial corr. (SHAP vs target) — Holdout split", fontsize=11)
+    ax.set_title(title, fontsize=13, fontweight="bold")
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.legend(loc="lower right", fontsize=10)
+
+    # Colorbar legend explaining the colours
+    cbar = fig.colorbar(scatter, ax=ax, shrink=0.75, pad=0.02)
+    cbar.set_label("Overfitting gap (train − holdout)", fontsize=10)
+
+    fig.tight_layout()
+    if save_path is not None:
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(save_path, bbox_inches="tight", dpi=150)
+    plt.show()
+    if save_path is not None:
+        plt.close(fig)
+
+
+# ===========================================================================
+# Section 9 — Business metrics helpers (labelled data only)
+# ===========================================================================
+
+
+def compute_incremental_churn_at_k(
+    y: np.ndarray,
+    treatment: np.ndarray,
+    uplift_scores: np.ndarray,
+    k: float,
+) -> dict:
+    """Compute incremental churn reduction when targeting the top *k*% by uplift.
+
+    Among the top *k*% of users (ranked by predicted uplift), we compare
+    churn rates between treated and control groups.  The difference is the
+    **realised incremental churn reduction** attributable to the treatment.
+
+    Parameters
+    ----------
+    y : np.ndarray
+        Binary churn labels (1 = churned).
+    treatment : np.ndarray
+        Binary treatment indicator (1 = treated / outreached).
+    uplift_scores : np.ndarray
+        Predicted uplift scores (higher = more benefit from treatment).
+    k : float
+        Fraction of population to target (e.g. 0.10 for top 10 %).
+
+    Returns
+    -------
+    dict
+        Keys: ``k``, ``n_targeted``, ``n_treated``, ``n_control``,
+        ``churn_rate_treated``, ``churn_rate_control``,
+        ``incremental_churn_reduction``, ``churns_prevented``.
+    """
+    y = np.asarray(y)
+    treatment = np.asarray(treatment)
+    uplift_scores = np.asarray(uplift_scores)
+    n = len(y)
+    n_target = max(1, int(n * k))
+
+    # Select the top-k% by predicted uplift
+    top_idx = np.argsort(-uplift_scores)[:n_target]
+    y_top = y[top_idx]
+    t_top = treatment[top_idx]
+
+    # Split into treated and control within top-k%
+    treated_mask = t_top == 1
+    control_mask = t_top == 0
+
+    n_treated = treated_mask.sum()
+    n_control = control_mask.sum()
+
+    # Churn rates within each group
+    churn_treated = y_top[treated_mask].mean() if n_treated > 0 else np.nan
+    churn_control = y_top[control_mask].mean() if n_control > 0 else np.nan
+
+    # Incremental reduction: how much churn drops from treatment
+    incremental = churn_control - churn_treated if (n_treated > 0 and n_control > 0) else np.nan
+
+    # Churns prevented = incremental_rate × n_targeted
+    churns_prevented = incremental * n_target if not np.isnan(incremental) else np.nan
+
+    return {
+        "k": k,
+        "n_targeted": n_target,
+        "n_treated": n_treated,
+        "n_control": n_control,
+        "churn_rate_treated": churn_treated,
+        "churn_rate_control": churn_control,
+        "incremental_churn_reduction": incremental,
+        "churns_prevented": churns_prevented,
+    }
+
+
+def compute_lift_over_random(
+    y: np.ndarray,
+    treatment: np.ndarray,
+    uplift_scores: np.ndarray,
+    k: float,
+) -> dict:
+    """Compute the model's lift over random targeting at the top *k*%.
+
+    Random targeting yields an expected incremental reduction proportional
+    to the **overall** treatment effect.  The lift ratio shows how much
+    better the model is than random at identifying treatable users.
+
+    Parameters
+    ----------
+    y : np.ndarray
+        Binary churn labels (1 = churned).
+    treatment : np.ndarray
+        Binary treatment indicator (1 = treated).
+    uplift_scores : np.ndarray
+        Predicted uplift scores.
+    k : float
+        Fraction of population targeted.
+
+    Returns
+    -------
+    dict
+        Keys: ``k``, ``model_reduction``, ``random_reduction``,
+        ``lift_ratio``, ``absolute_gain``.
+    """
+    y = np.asarray(y)
+    treatment = np.asarray(treatment)
+
+    # Overall (population-level) incremental churn reduction
+    overall_churn_treated = y[treatment == 1].mean()
+    overall_churn_control = y[treatment == 0].mean()
+    overall_incremental = overall_churn_control - overall_churn_treated
+
+    # Random targeting: expected reduction at k%
+    random_reduction = overall_incremental * k
+
+    # Model-based targeting at k%
+    model_stats = compute_incremental_churn_at_k(y, treatment, uplift_scores, k)
+    model_reduction = model_stats["incremental_churn_reduction"] * k
+
+    # Lift ratio (model / random); guard against division by zero
+    lift_ratio = (model_reduction / random_reduction) if random_reduction != 0 else np.nan
+    absolute_gain = model_reduction - random_reduction
+
+    return {
+        "k": k,
+        "model_reduction": model_reduction,
+        "random_reduction": random_reduction,
+        "lift_ratio": lift_ratio,
+        "absolute_gain": absolute_gain,
+    }
+
+
+def build_capacity_curve_data(
+    y: np.ndarray,
+    treatment: np.ndarray,
+    uplift_scores: np.ndarray,
+    steps: int = 20,
+) -> pd.DataFrame:
+    """Build a capacity curve: cumulative churns prevented vs. fraction targeted.
+
+    For each step from 0 % to 100 %, compute how many **incremental
+    churns** would be prevented if we target the top *k*% by predicted
+    uplift.
+
+    Parameters
+    ----------
+    y : np.ndarray
+        Binary churn labels (1 = churned).
+    treatment : np.ndarray
+        Binary treatment indicator.
+    uplift_scores : np.ndarray
+        Predicted uplift scores (higher = more benefit).
+    steps : int
+        Number of evenly spaced capacity levels between 0 and 1.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: ``fraction_targeted``, ``incremental_churn_reduction``,
+        ``churns_prevented``, ``churns_per_1k_outreaches``.
+    """
+    fractions = np.linspace(0, 1, steps + 1)[1:]  # skip 0%
+    rows = []
+    for frac in fractions:
+        stats = compute_incremental_churn_at_k(y, treatment, uplift_scores, frac)
+        churns_prev = stats["churns_prevented"]
+        n_targeted = stats["n_targeted"]
+        # Churns prevented per 1,000 outreaches
+        per_1k = (churns_prev / n_targeted * 1000) if (n_targeted > 0 and not np.isnan(churns_prev)) else np.nan
+        rows.append({
+            "fraction_targeted": frac,
+            "incremental_churn_reduction": stats["incremental_churn_reduction"],
+            "churns_prevented": churns_prev,
+            "churns_per_1k_outreaches": per_1k,
+        })
+    return pd.DataFrame(rows)
+
+
+def plot_capacity_curve(
+    capacity_df: pd.DataFrame,
+    title: str = "Capacity curve — incremental churns prevented by contact rate",
+    figsize: tuple = (9, 5),
+) -> None:
+    """Plot cumulative incremental churns prevented vs. fraction of users targeted.
+
+    Shows where marginal benefit flattens: beyond a certain contact rate,
+    each additional outreach prevents fewer churns.
+
+    Parameters
+    ----------
+    capacity_df : pd.DataFrame
+        Output of ``build_capacity_curve_data``.
+    title : str
+        Plot title.
+    figsize : tuple
+        Figure size.
+
+    Returns
+    -------
+    None
+        Displays the plot.
+    """
+    fig, ax1 = plt.subplots(figsize=figsize)
+    fracs = capacity_df["fraction_targeted"] * 100  # percent
+
+    # Primary axis: cumulative churns prevented
+    color1 = "#2c7bb6"
+    ax1.plot(fracs, capacity_df["churns_prevented"], color=color1,
+             marker="o", markersize=4, linewidth=2, label="Churns prevented")
+    ax1.set_xlabel("% of users contacted", fontsize=12)
+    ax1.set_ylabel("Cumulative churns prevented", fontsize=12, color=color1)
+    ax1.tick_params(axis="y", labelcolor=color1)
+
+    # Secondary axis: churns per 1k outreaches (efficiency)
+    ax2 = ax1.twinx()
+    color2 = "#d7191c"
+    ax2.plot(fracs, capacity_df["churns_per_1k_outreaches"], color=color2,
+             marker="s", markersize=4, linewidth=2, linestyle="--",
+             label="Churns prevented per 1k outreaches")
+    ax2.set_ylabel("Churns prevented per 1,000 outreaches", fontsize=12, color=color2)
+    ax2.tick_params(axis="y", labelcolor=color2)
+
+    ax1.set_title(title, fontsize=13, fontweight="bold")
+    ax1.spines["top"].set_visible(False)
+    ax2.spines["top"].set_visible(False)
+
+    # Combine legends
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc="center right", fontsize=10)
+
+    fig.tight_layout()
+
+
+def build_segment_quality_table(
+    y: np.ndarray,
+    treatment: np.ndarray,
+    uplift_scores: np.ndarray,
+    segments: np.ndarray,
+) -> pd.DataFrame:
+    """Per-segment quality table with realised churn rates and uplift.
+
+    For each segment reports size, average predicted uplift, churn rate
+    in treated vs. control, and realised incremental churn reduction.
+
+    Parameters
+    ----------
+    y : np.ndarray
+        Binary churn labels (1 = churned).
+    treatment : np.ndarray
+        Binary treatment indicator.
+    uplift_scores : np.ndarray
+        Predicted uplift scores.
+    segments : np.ndarray
+        Segment labels (e.g. "Persuadables", "Sure Things", etc.).
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per segment with quality metrics.
+    """
+    y = np.asarray(y)
+    treatment = np.asarray(treatment)
+    uplift_scores = np.asarray(uplift_scores)
+    segments = np.asarray(segments)
+
+    seg_order = ["Persuadables", "Sure Things", "Lost Causes", "Do-Not-Disturb"]
+    rows = []
+    for seg in seg_order:
+        mask = segments == seg
+        n = mask.sum()
+        if n == 0:
+            continue
+        y_seg = y[mask]
+        t_seg = treatment[mask]
+        u_seg = uplift_scores[mask]
+
+        n_treated = (t_seg == 1).sum()
+        n_control = (t_seg == 0).sum()
+        churn_treated = y_seg[t_seg == 1].mean() if n_treated > 0 else np.nan
+        churn_control = y_seg[t_seg == 0].mean() if n_control > 0 else np.nan
+        realised_uplift = (churn_control - churn_treated) if (n_treated > 0 and n_control > 0) else np.nan
+
+        rows.append({
+            "Segment": seg,
+            "N": n,
+            "Share (%)": round(n / len(y) * 100, 1),
+            "Avg predicted uplift": round(u_seg.mean(), 4),
+            "Churn rate (treated)": round(churn_treated, 4) if not np.isnan(churn_treated) else np.nan,
+            "Churn rate (control)": round(churn_control, 4) if not np.isnan(churn_control) else np.nan,
+            "Realised uplift": round(realised_uplift, 4) if not np.isnan(realised_uplift) else np.nan,
+        })
+    return pd.DataFrame(rows)
+
+
+def build_business_metrics_summary(
+    y: np.ndarray,
+    treatment: np.ndarray,
+    uplift_scores: np.ndarray,
+    ks: list[float] | None = None,
+) -> pd.DataFrame:
+    """Compact business-metrics summary table at multiple targeting thresholds.
+
+    Combines incremental churn reduction, lift over random, and
+    efficiency (churns per 1k outreaches) for each *k*.
+
+    Parameters
+    ----------
+    y : np.ndarray
+        Binary churn labels (1 = churned).
+    treatment : np.ndarray
+        Binary treatment indicator.
+    uplift_scores : np.ndarray
+        Predicted uplift scores.
+    ks : list[float] or None
+        Targeting fractions.  Defaults to ``[0.05, 0.10, 0.20, 0.30, 0.50]``.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per *k* with key business metrics.
+    """
+    if ks is None:
+        ks = [0.05, 0.10, 0.20, 0.30, 0.50]
+
+    rows = []
+    for k in ks:
+        churn_stats = compute_incremental_churn_at_k(y, treatment, uplift_scores, k)
+        lift_stats = compute_lift_over_random(y, treatment, uplift_scores, k)
+        n_target = churn_stats["n_targeted"]
+        cp = churn_stats["churns_prevented"]
+        per_1k = (cp / n_target * 1000) if (n_target > 0 and not np.isnan(cp)) else np.nan
+
+        rows.append({
+            "Top k%": f"{k*100:.0f}%",
+            "N targeted": n_target,
+            "Churn (treated)": round(churn_stats["churn_rate_treated"], 4),
+            "Churn (control)": round(churn_stats["churn_rate_control"], 4),
+            "Incremental reduction": round(churn_stats["incremental_churn_reduction"], 4),
+            "Churns prevented": round(cp, 1) if not np.isnan(cp) else np.nan,
+            "Churns / 1k outreaches": round(per_1k, 1) if not np.isnan(per_1k) else np.nan,
+            "Lift over random": round(lift_stats["lift_ratio"], 2) if not np.isnan(lift_stats["lift_ratio"]) else np.nan,
+        })
+    return pd.DataFrame(rows)
