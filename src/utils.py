@@ -5646,7 +5646,7 @@ def plot_capacity_curve(
     ax1.plot(fracs, capacity_df["churns_prevented"], color=color1,
              marker="o", markersize=4, linewidth=2, label="Churns prevented")
     ax1.set_xlabel("% of users contacted", fontsize=12)
-    ax1.set_ylabel("Cumulative churns prevented", fontsize=12, color=color1)
+    ax1.set_ylabel("Cumulative churns prevented (count)", fontsize=12, color=color1)
     ax1.tick_params(axis="y", labelcolor=color1)
 
     # Secondary axis: churns per 1k outreaches (efficiency)
@@ -5739,8 +5739,8 @@ def build_business_metrics_summary(
 ) -> pd.DataFrame:
     """Compact business-metrics summary table at multiple targeting thresholds.
 
-    Combines incremental churn reduction, lift over random, and
-    efficiency (churns per 1k outreaches) for each *k*.
+    Each column includes a measurement unit in its name. Churns prevented
+    is expressed as a percentage (rate in the targeted slice), not as a count.
 
     Parameters
     ----------
@@ -5756,7 +5756,8 @@ def build_business_metrics_summary(
     Returns
     -------
     pd.DataFrame
-        One row per *k* with key business metrics.
+        One row per *k* with columns: Top k% (%), N targeted (n), Churn treated (fraction),
+        Churn control (fraction), Churns prevented (%), Lift over random (ratio).
     """
     if ks is None:
         ks = [0.05, 0.10, 0.20, 0.30, 0.50]
@@ -5766,17 +5767,315 @@ def build_business_metrics_summary(
         churn_stats = compute_incremental_churn_at_k(y, treatment, uplift_scores, k)
         lift_stats = compute_lift_over_random(y, treatment, uplift_scores, k)
         n_target = churn_stats["n_targeted"]
-        cp = churn_stats["churns_prevented"]
-        per_1k = (cp / n_target * 1000) if (n_target > 0 and not np.isnan(cp)) else np.nan
+        inc = churn_stats["incremental_churn_reduction"]
+        # Churns prevented as % (rate in targeted slice), not count
+        churns_prevented_pct = (inc * 100) if not np.isnan(inc) else np.nan
 
-        rows.append({
-            "Top k%": f"{k*100:.0f}%",
-            "N targeted": n_target,
-            "Churn (treated)": round(churn_stats["churn_rate_treated"], 4),
-            "Churn (control)": round(churn_stats["churn_rate_control"], 4),
-            "Incremental reduction": round(churn_stats["incremental_churn_reduction"], 4),
-            "Churns prevented": round(cp, 1) if not np.isnan(cp) else np.nan,
-            "Churns / 1k outreaches": round(per_1k, 1) if not np.isnan(per_1k) else np.nan,
-            "Lift over random": round(lift_stats["lift_ratio"], 2) if not np.isnan(lift_stats["lift_ratio"]) else np.nan,
-        })
+        row = {
+            "Top k% (%)": f"{k*100:.0f}%",
+            "N targeted (n)": n_target,
+            "Churn treated (fraction)": round(churn_stats["churn_rate_treated"], 4),
+            "Churn control (fraction)": round(churn_stats["churn_rate_control"], 4),
+            "Churns prevented (%)": round(churns_prevented_pct, 2) if not np.isnan(churns_prevented_pct) else np.nan,
+            "Lift over random (ratio)": round(lift_stats["lift_ratio"], 2) if not np.isnan(lift_stats["lift_ratio"]) else np.nan,
+        }
+        rows.append(row)
     return pd.DataFrame(rows)
+
+
+def plot_business_churns_prevented_bar(
+    summary_df: pd.DataFrame,
+    title: str = "Churns prevented by targeting top k%",
+    figsize: tuple = (8, 4),
+) -> None:
+    """Bar chart of churns prevented (%) at each top-k% threshold (for stakeholder presentation).
+
+    Parameters
+    ----------
+    summary_df : pd.DataFrame
+        Output of ``build_business_metrics_summary`` (must have "Top k% (%)" and "Churns prevented (%)").
+    title : str
+        Plot title.
+    figsize : tuple
+        Figure size (width, height).
+
+    Returns
+    -------
+    None
+        Displays the plot.
+    """
+    col_k = "Top k% (%)"
+    col_cp = "Churns prevented (%)"
+    if col_cp not in summary_df.columns:
+        return
+    fig, ax = plt.subplots(figsize=figsize)
+    x_labels = summary_df[col_k].astype(str)
+    vals = summary_df[col_cp].values
+    vals_plot = np.where(np.isnan(vals), 0.0, vals)
+    x_pos = np.arange(len(x_labels))
+    bars = ax.bar(x_pos, vals_plot, color="#2c7bb6", edgecolor="none")
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels(x_labels)
+    ax.set_xlabel("Top k% targeted (%)", fontsize=11)
+    ax.set_ylabel("Churns prevented (%)", fontsize=11)
+    ax.set_title(title, fontsize=12, fontweight="bold")
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    for i, (bar, v) in enumerate(zip(bars, vals)):
+        if not np.isnan(v):
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5, f"{v:.2f}",
+                    ha="center", va="bottom", fontsize=9)
+    fig.tight_layout()
+    plt.show()
+
+
+def plot_business_incremental_reduction_bar(
+    summary_df: pd.DataFrame,
+    title: str = "Incremental churn reduction (Uplift@k) by top k%",
+    figsize: tuple = (8, 4),
+) -> None:
+    """Bar chart of incremental churn reduction (Uplift@k) at each top-k% threshold.
+
+    Uses "Churns prevented (%)" from the summary table (same metric as incremental reduction in %).
+
+    Parameters
+    ----------
+    summary_df : pd.DataFrame
+        Output of ``build_business_metrics_summary`` ("Top k% (%)", "Churns prevented (%)").
+    title : str
+        Plot title.
+    figsize : tuple
+        Figure size.
+
+    Returns
+    -------
+    None
+        Displays the plot.
+    """
+    col_k = "Top k% (%)"
+    col_pct = "Churns prevented (%)"
+    if col_pct not in summary_df.columns:
+        return
+    fig, ax = plt.subplots(figsize=figsize)
+    x_labels = summary_df[col_k].astype(str)
+    vals = summary_df[col_pct].values
+    vals_plot = np.where(np.isnan(vals), 0.0, vals)
+    x_pos = np.arange(len(x_labels))
+    ax.bar(x_pos, vals_plot, color="#2c7bb6", edgecolor="none")
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels(x_labels)
+    ax.set_xlabel("Top k% targeted (%)", fontsize=11)
+    ax.set_ylabel("Uplift@k (%)", fontsize=11)
+    ax.set_title(title, fontsize=12, fontweight="bold")
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    fig.tight_layout()
+    plt.show()
+
+
+def plot_business_lift_over_random_bar(
+    summary_df: pd.DataFrame,
+    title: str = "Lift over random targeting by top k%",
+    figsize: tuple = (8, 4),
+) -> None:
+    """Bar chart of lift over random at each top-k% threshold.
+
+    Parameters
+    ----------
+    summary_df : pd.DataFrame
+        Output of ``build_business_metrics_summary`` ("Top k% (%)", "Lift over random (ratio)").
+    title : str
+        Plot title.
+    figsize : tuple
+        Figure size.
+
+    Returns
+    -------
+    None
+        Displays the plot.
+    """
+    col_k = "Top k% (%)"
+    col_lift = "Lift over random (ratio)"
+    if col_lift not in summary_df.columns:
+        return
+    fig, ax = plt.subplots(figsize=figsize)
+    x_labels = summary_df[col_k].astype(str)
+    vals = summary_df[col_lift].values
+    vals_plot = np.where(np.isnan(vals), 0.0, vals)
+    x_pos = np.arange(len(x_labels))
+    ax.bar(x_pos, vals_plot, color="#2c7bb6", edgecolor="none")
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels(x_labels)
+    ax.set_xlabel("Top k% targeted (%)", fontsize=11)
+    ax.set_ylabel("Lift over random (ratio)", fontsize=11)
+    ax.set_title(title, fontsize=12, fontweight="bold")
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    fig.tight_layout()
+    plt.show()
+
+
+def plot_business_revenue_saved_bar(
+    summary_df: pd.DataFrame,
+    title: str = "Revenue saved by targeting top k%",
+    figsize: tuple = (8, 4),
+) -> None:
+    """Bar chart of revenue saved at each top-k% (no-op; revenue column removed from summary).
+
+    Parameters
+    ----------
+    summary_df : pd.DataFrame
+        Output of ``build_business_metrics_summary`` (no revenue column by default).
+    title : str
+        Plot title.
+    figsize : tuple
+        Figure size.
+
+    Returns
+    -------
+    None
+        Displays the plot. No-op if "Revenue saved" column is missing.
+    """
+    if "Revenue saved" not in summary_df.columns:
+        return
+    fig, ax = plt.subplots(figsize=figsize)
+    x_labels = summary_df["Top k%"].astype(str)
+    vals = summary_df["Revenue saved"].values
+    vals_plot = np.where(np.isnan(vals), 0.0, vals)
+    x_pos = np.arange(len(x_labels))
+    bars = ax.bar(x_pos, vals_plot, color="#2ca02c", edgecolor="none")
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels(x_labels)
+    ax.set_xlabel("Top k% targeted (%)", fontsize=11)
+    ax.set_ylabel("Revenue saved ($)", fontsize=11)
+    ax.set_title(title, fontsize=12, fontweight="bold")
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    for bar, v in zip(bars, vals):
+        if not np.isnan(v):
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5, f"${v:,.0f}",
+                    ha="center", va="bottom", fontsize=9)
+    fig.tight_layout()
+    plt.show()
+
+
+def plot_segment_quality_grouped_bar(
+    segment_df: pd.DataFrame,
+    title: str = "Segment quality: churn rate (treated vs control)",
+    figsize: tuple = (8, 4),
+) -> None:
+    """Grouped bar chart: per-segment churn rate (treated vs control) for stakeholder presentation.
+
+    Parameters
+    ----------
+    segment_df : pd.DataFrame
+        Output of ``build_segment_quality_table`` (columns: Segment, Churn rate (treated), Churn rate (control)).
+    title : str
+        Plot title.
+    figsize : tuple
+        Figure size.
+
+    Returns
+    -------
+    None
+        Displays the plot.
+    """
+    if "Churn rate (treated)" not in segment_df.columns or "Churn rate (control)" not in segment_df.columns:
+        return
+    fig, ax = plt.subplots(figsize=figsize)
+    segments = segment_df["Segment"].astype(str)
+    x = np.arange(len(segments))
+    w = 0.35
+    treated = segment_df["Churn rate (treated)"].fillna(0).values
+    control = segment_df["Churn rate (control)"].fillna(0).values
+    ax.bar(x - w / 2, treated, w, label="Churn (treated)", color="#2c7bb6")
+    ax.bar(x + w / 2, control, w, label="Churn (control)", color="#d7191c", alpha=0.8)
+    ax.set_xticks(x)
+    ax.set_xticklabels(segments)
+    ax.set_xlabel("Segment", fontsize=11)
+    ax.set_ylabel("Churn rate (fraction; 0–1)", fontsize=11)
+    ax.set_title(title, fontsize=12, fontweight="bold")
+    ax.legend(loc="upper right", fontsize=10)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    fig.tight_layout()
+    plt.show()
+
+
+def compute_and_print_baseline_benchmark(
+    y: np.ndarray,
+    treatment: np.ndarray,
+    benchmark_financial: tuple[float, float] = (2.0, 4.0),
+    benchmark_wellness: tuple[float, float] = (7.0, 10.0),
+    print_result: bool = True,
+) -> dict:
+    """Compare churn with outreach (treated) to industry benchmarks; control reported for context.
+
+    The meaningful comparison for stakeholders is: when we do outreach (treated
+    group), where does our churn sit vs. 2–4% (financial) and 7–10% (wellness)?
+    Control (no outreach) churn is reported only as context.
+
+    Parameters
+    ----------
+    y : np.ndarray
+        Binary churn labels (1 = churned).
+    treatment : np.ndarray
+        Binary treatment indicator (0 = control, 1 = treated/outreach).
+    benchmark_financial : tuple[float, float]
+        (low, high) monthly churn % for financial benchmark. Default (2, 4).
+    benchmark_wellness : tuple[float, float]
+        (low, high) monthly churn % for wellness benchmark. Default (7, 10).
+    print_result : bool
+        If True, print control (context), treated churn, and benchmark comparison.
+
+    Returns
+    -------
+    dict
+        Keys: ``control_churn_pct``, ``n_control``, ``treated_churn_pct``,
+        ``n_treated``, ``vs_financial``, ``vs_wellness`` (comparison for treated).
+    """
+    y_arr = np.asarray(y)
+    t_arr = np.asarray(treatment)
+    control_mask = t_arr == 0
+    treated_mask = t_arr == 1
+    n_control = int(control_mask.sum())
+    n_treated = int(treated_mask.sum())
+
+    control_churn_rate = float(y_arr[control_mask].mean()) if n_control > 0 else np.nan
+    treated_churn_rate = float(y_arr[treated_mask].mean()) if n_treated > 0 else np.nan
+    control_churn_pct = control_churn_rate * 100 if not np.isnan(control_churn_rate) else np.nan
+    treated_churn_pct = treated_churn_rate * 100 if not np.isnan(treated_churn_rate) else np.nan
+
+    # Compare *treated* (with outreach) churn to benchmarks
+    pct = treated_churn_pct if not np.isnan(treated_churn_pct) else 0.0
+    fin_lo, fin_hi = benchmark_financial
+    if pct < fin_lo:
+        vs_fin = "below the 2–4% financial/subscription benchmark"
+    elif pct <= fin_hi:
+        vs_fin = "within the 2–4% financial/subscription benchmark"
+    else:
+        vs_fin = "above the 2–4% financial/subscription benchmark"
+
+    well_lo, well_hi = benchmark_wellness
+    if pct < well_lo:
+        vs_well = "below the 7–10% wellness/engagement benchmark"
+    elif pct <= well_hi:
+        vs_well = "within the 7–10% wellness/engagement benchmark"
+    else:
+        vs_well = "above the 7–10% wellness/engagement benchmark"
+
+    out = {
+        "control_churn_rate": control_churn_rate,
+        "control_churn_pct": control_churn_pct,
+        "n_control": n_control,
+        "treated_churn_rate": treated_churn_rate,
+        "treated_churn_pct": treated_churn_pct,
+        "n_treated": n_treated,
+        "vs_financial": vs_fin,
+        "vs_wellness": vs_well,
+    }
+    if print_result:
+        print(f"Control (no outreach) monthly churn: {control_churn_pct:.2f}% (n={n_control:,}).")
+        print(f"Treated (with outreach) monthly churn: {treated_churn_pct:.2f}% (n={n_treated:,}).")
+        print(f"When we do outreach, churn is {vs_fin} and {vs_well}.")
+    return out
