@@ -417,6 +417,101 @@ def missingness_mechanism_analysis(
     plt.show()
 
 
+def _chi2_pvalue_safe(crosstab: pd.DataFrame) -> float | None:
+    """Run chi-square test on a 2x2 (or larger) crosstab; return p-value or None if invalid.
+
+    Parameters
+    ----------
+    crosstab : pandas.DataFrame
+        Contingency table (e.g. is_null x churn).
+
+    Returns
+    -------
+    float or None
+        P-value from chi2_contingency, or None if table too small or has zero cells.
+    """
+    if crosstab.size < 4 or crosstab.min().min() < 1:
+        return None
+    try:
+        _, p, _, _ = chi2_contingency(crosstab)
+        return float(p)
+    except Exception:
+        return None
+
+
+def missingness_mechanism_aggregated_table(
+    member_agg: pd.DataFrame,
+    churn_labels: pd.DataFrame,
+    alpha: float = 0.05,
+    print_result: bool = True,
+) -> pd.DataFrame:
+    """Assess missingness mechanism per column of an aggregated member table (MCAR vs MAR).
+
+    For each column that has nulls, runs chi-square tests of "is null" vs churn and vs
+    outreach. Labels mechanism as MAR when missingness is associated with that outcome,
+    or MCAR when there is no significant association.
+
+    Parameters
+    ----------
+    member_agg : pandas.DataFrame
+        Per-member aggregate table (one row per member); must include member_id.
+    churn_labels : pandas.DataFrame
+        Labels with columns member_id, churn, outreach.
+    alpha : float, optional
+        Significance level for chi-square (default 0.05).
+    print_result : bool, optional
+        If True, print the results table and interpretation (default True).
+
+    Returns
+    -------
+    pandas.DataFrame
+        Columns: column, null_count, churn_p, outreach_p, mechanism.
+    """
+    agg_with_labels = member_agg.merge(
+        churn_labels[["member_id", "churn", "outreach"]], on="member_id", how="inner"
+    )
+    results: list[dict] = []
+    for col in member_agg.columns:
+        null_count = member_agg[col].isna().sum()
+        if null_count == 0:
+            results.append({
+                "column": col,
+                "null_count": 0,
+                "churn_p": "—",
+                "outreach_p": "—",
+                "mechanism": "no nulls",
+            })
+            continue
+        is_null = agg_with_labels[col].isna().astype(int)
+        p_churn = _chi2_pvalue_safe(pd.crosstab(is_null, agg_with_labels["churn"]))
+        p_outreach = _chi2_pvalue_safe(pd.crosstab(is_null, agg_with_labels["outreach"]))
+        sig_churn = p_churn is not None and p_churn < alpha
+        sig_outreach = p_outreach is not None and p_outreach < alpha
+        if sig_churn and sig_outreach:
+            mechanism = "MAR (churn & outreach)"
+        elif sig_churn:
+            mechanism = "MAR (churn)"
+        elif sig_outreach:
+            mechanism = "MAR (outreach)"
+        else:
+            mechanism = "MCAR (no sig. association)"
+        results.append({
+            "column": col,
+            "null_count": int(null_count),
+            "churn_p": round(p_churn, 4) if p_churn is not None else "—",
+            "outreach_p": round(p_outreach, 4) if p_outreach is not None else "—",
+            "mechanism": mechanism,
+        })
+    res_df = pd.DataFrame(results).sort_values("null_count", ascending=False).reset_index(drop=True)
+    if print_result:
+        print("=" * 80)
+        print("  Per-member table: missingness mechanism by column (null vs churn / outreach)")
+        print("=" * 80)
+        print(res_df.to_string(index=False))
+        print("\nInterpretation: MAR = missingness associated with observed variable; MCAR = no significant association.")
+    return res_df
+
+
 def plot_balance(
     data: pd.DataFrame,
     x: str,
@@ -607,14 +702,150 @@ def plot_feature_histograms(
     plt.show()
 
 
+# ---------------------------------------------------------------------------
+# Bivariate / variable distribution EDA (KDE for numeric, bar for categorical)
+# ---------------------------------------------------------------------------
+
+def _is_numeric_series(s: pd.Series) -> bool:
+    """True if series is numeric or datetime (datetime plotted as KDE of ordinal)."""
+    return pd.api.types.is_numeric_dtype(s) or pd.api.types.is_datetime64_any_dtype(s)
+
+
+def _plot_numeric_kde(series: pd.Series, ax, title: str) -> None:
+    """Plot kernel density for a numeric or datetime series on the given axes."""
+    data = series.dropna()
+    if pd.api.types.is_datetime64_any_dtype(series):
+        data = data.astype("int64")
+    if data.empty or data.nunique() < 2:
+        ax.text(0.5, 0.5, "Insufficient variation", ha="center", va="center", transform=ax.transAxes)
+        ax.set_title(title)
+        return
+    sns.kdeplot(data=data, ax=ax, fill=True)
+    ax.set_title(title, fontweight="bold")
+    ax.set_ylabel("Density")
+
+
+def _plot_categorical_bars(
+    series: pd.Series,
+    ax,
+    title: str,
+    max_labels: int,
+    high_card_threshold: int,
+) -> None:
+    """Bar plot of value_counts(); x-axis labels vertical. High-cardinality: top N + Other, no raw names."""
+    vc = series.value_counts()
+    n_unique = len(vc)
+    if n_unique > high_card_threshold:
+        top_n = min(15, n_unique)
+        top = vc.head(top_n)
+        other_count = vc.iloc[top_n:].sum()
+        if other_count > 0:
+            top = pd.concat([top, pd.Series({"Other": other_count})])
+        labels = [str(i + 1) for i in range(len(top))]
+        if "Other" in top.index:
+            labels[-1] = "Other"
+        counts = top.values
+        ax.bar(range(len(counts)), counts, edgecolor="white", alpha=0.8)
+        ax.set_xticks(range(len(counts)))
+        ax.set_xticklabels(labels, rotation=90)
+        ax.set_xlabel(
+            f"Top {top_n} categories (1..{top_n}) + Other — names omitted (>{high_card_threshold} levels)"
+        )
+    else:
+        plot_vc = vc.head(max_labels)
+        ax.bar(range(len(plot_vc)), plot_vc.values, edgecolor="white", alpha=0.8)
+        ax.set_xticks(range(len(plot_vc)))
+        ax.set_xticklabels(plot_vc.index.astype(str), rotation=90, ha="right")
+        if n_unique > max_labels:
+            ax.set_xlabel(f"Top {max_labels} of {n_unique} categories")
+    ax.set_title(title, fontweight="bold")
+    ax.set_ylabel("Count")
+
+
+def plot_variable_distributions(
+    tables: dict[str, pd.DataFrame],
+    *,
+    skip_cols: set[str] | None = None,
+    max_cat_labels: int = 20,
+    high_cardinality_threshold: int = 50,
+    ncols: int = 3,
+    figsize_per_plot: tuple[int, int] = (5, 4),
+    omit_table_name_in_titles: bool = False,
+) -> None:
+    """Plot per-variable distributions: KDE for numeric/datetime, bar for categorical.
+
+    For each table, plots one subplot per column (excluding skip_cols). Numeric and
+    datetime columns use kernel density; categorical use bar plots with vertical x-axis
+    labels. High-cardinality categoricals (e.g. url) are shown as top N + Other without
+    raw names on the x-axis.
+
+    Parameters
+    ----------
+    tables : dict of str -> pandas.DataFrame
+        Map table name -> DataFrame. Columns to plot are inferred (all except skip_cols).
+    skip_cols : set of str or None, optional
+        Column names to exclude from every table (e.g. member_id). Default {"member_id"}.
+    max_cat_labels : int, optional
+        Max category labels to show on x-axis for non–high-cardinality categoricals (default 20).
+    high_cardinality_threshold : int, optional
+        Above this many unique values, categorical is shown as top 15 + Other only (default 50).
+    ncols : int, optional
+        Number of subplot columns per figure (default 3).
+    figsize_per_plot : tuple of (int, int), optional
+        (width, height) per subplot; total figsize = (ncols * w, nrows * h) (default (5, 4)).
+    omit_table_name_in_titles : bool, optional
+        If True, subplot titles show only column name and suptitle is "Variable distributions" (default False).
+
+    Returns
+    -------
+    None
+    """
+    if skip_cols is None:
+        skip_cols = {"member_id"}
+    for table_name, df in tables.items():
+        cols = [c for c in df.columns if c not in skip_cols]
+        if not cols:
+            continue
+        title_prefix = "" if omit_table_name_in_titles else f"{table_name}: "
+        suptitle = "Variable distributions" if omit_table_name_in_titles else f"Variable distributions — {table_name}"
+        numeric_cols = [c for c in cols if _is_numeric_series(df[c])]
+        cat_cols = [c for c in cols if c not in numeric_cols]
+        n_plots = len(numeric_cols) + len(cat_cols)
+        nrows = (n_plots + ncols - 1) // ncols
+        fig, axes = plt.subplots(
+            nrows, ncols,
+            figsize=(ncols * figsize_per_plot[0], nrows * figsize_per_plot[1]),
+            constrained_layout=True,
+        )
+        axes = np.atleast_1d(axes).flatten()
+        idx = 0
+        for col in numeric_cols:
+            _plot_numeric_kde(df[col], axes[idx], f"{title_prefix}{col}")
+            idx += 1
+        for col in cat_cols:
+            _plot_categorical_bars(
+                df[col], axes[idx], f"{title_prefix}{col}",
+                max_labels=max_cat_labels,
+                high_card_threshold=high_cardinality_threshold,
+            )
+            idx += 1
+        for j in range(idx, len(axes)):
+            axes[j].set_visible(False)
+        fig.suptitle(suptitle, fontsize=14, fontweight="bold", y=1.02)
+        plt.show()
+
+
 def plot_correlation_diagnostics(
     df: pd.DataFrame,
     feature_cols: list[str],
     threshold: float = 0.8,
     title_suffix: str = "",
-    figsize: tuple[int, int] = (10, 8),
+    figsize: tuple[int, int] | None = None,
 ) -> None:
     """Plot feature correlation heatmap and print pairs with |r| >= threshold.
+
+    Figure size and annotation font scale with number of features so the heatmap
+    stays readable (no overlapping labels or cell values).
 
     Parameters
     ----------
@@ -626,17 +857,35 @@ def plot_correlation_diagnostics(
         Minimum |correlation| to flag (default 0.8).
     title_suffix : str, optional
         Suffix for the plot title (e.g. '(train set)').
-    figsize : tuple of (int, int), optional
-        Figure size (default (10, 8)).
+    figsize : tuple of (int, int) or None, optional
+        Figure size. If None, scales with number of features (default None).
 
     Returns
     -------
     None
     """
-    corr = df[feature_cols].corr()
+    # Use only rows with no NaN in any feature; then drop constant columns so .corr() has no NaN (no empty cells).
+    df_clean = df[feature_cols].dropna()
+    variances = df_clean.var()
+    cols_nonconst = [c for c in feature_cols if variances[c] > 0]
+    excluded = [c for c in feature_cols if c not in cols_nonconst]
+    if excluded:
+        print(f"Excluding constant columns (zero variance in complete-case subset): {excluded}")
+    feature_cols_use = cols_nonconst if cols_nonconst else feature_cols
+    corr = df_clean[feature_cols_use].corr()
+    # For display only: treat near-zero correlations as 0 so we show "0.00" instead of "-0.00" / "0.00" (zero is zero).
+    corr_display = corr.copy()
+    corr_display[np.abs(corr_display) < 0.005] = 0.0
+    n = len(feature_cols_use)
+    if figsize is None:
+        # Scale figure so each cell is large enough; minimum (10, 8).
+        side = max(10, int(n * 0.55))
+        figsize = (side, side)
     plt.figure(figsize=figsize)
-    sns.heatmap(
-        corr,
+    # Annotation font: large enough to read (especially on near-zero light cells), scales down only for very many features.
+    annot_font = max(8, 13 - n // 2)
+    ax = sns.heatmap(
+        corr_display,
         annot=True,
         fmt=".2f",
         cmap="coolwarm",
@@ -644,24 +893,219 @@ def plot_correlation_diagnostics(
         vmax=1,
         square=True,
         linewidths=0.5,
+        annot_kws={"size": annot_font},
+        cbar_kws={"shrink": 0.8},
     )
     title = f"Feature Correlation Matrix {title_suffix}".strip()
-    plt.title(title, fontsize=14, fontweight="bold")
-    plt.xlabel("Feature", fontsize=12)
-    plt.ylabel("Feature", fontsize=12)
-    set_axes_clear(plt.gca(), x_axis_at_zero=False)
+    ax.set_title(title, fontsize=14, fontweight="bold")
+    ax.set_xlabel("Feature", fontsize=12)
+    ax.set_ylabel("Feature", fontsize=12)
+    # X-axis labels vertical; y-axis horizontal.
+    ax.set_xticklabels(ax.get_xticklabels(), rotation=90, ha="right", fontsize=9)
+    ax.set_yticklabels(ax.get_yticklabels(), rotation=0, fontsize=9)
+    set_axes_clear(ax, x_axis_at_zero=False)
     plt.tight_layout()
     plt.show()
     print(f"\nPairs with |correlation| >= {threshold}:")
     flagged: list[tuple[str, str, float]] = []
-    for i in range(len(feature_cols)):
-        for j in range(i + 1, len(feature_cols)):
+    for i in range(len(feature_cols_use)):
+        for j in range(i + 1, len(feature_cols_use)):
             r = corr.iloc[i, j]
             if abs(r) >= threshold:
-                flagged.append((feature_cols[i], feature_cols[j], r))
-                print(f"  {feature_cols[i]}  ↔  {feature_cols[j]}  :  r = {r:.3f}")
+                flagged.append((feature_cols_use[i], feature_cols_use[j], r))
+                print(f"  {feature_cols_use[i]}  ↔  {feature_cols_use[j]}  :  r = {r:.3f}")
     if not flagged:
         print("  (none)")
+
+
+def _churn_rate_by_decile(series: pd.Series, churn: pd.Series, n_deciles: int = 10) -> pd.Series:
+    """Compute mean churn (outcome) per decile of a feature. Drops NaN in series; uses qcut with duplicates='drop'.
+
+    Parameters
+    ----------
+    series : pandas.Series
+        Feature values.
+    churn : pandas.Series
+        Binary outcome (0/1), same index as series.
+    n_deciles : int, optional
+        Number of bins (default 10).
+
+    Returns
+    -------
+    pandas.Series
+        Index = decile interval labels, values = mean churn in that decile.
+    """
+    use = pd.DataFrame({"x": series, "y": churn}).dropna(subset=["x"])
+    if use.empty:
+        return pd.Series(dtype=float)
+    try:
+        use["_bin"] = pd.qcut(use["x"], q=n_deciles, duplicates="drop")
+    except Exception:
+        use["_bin"] = pd.qcut(use["x"].rank(method="first"), q=n_deciles, duplicates="drop")
+    return use.groupby("_bin", observed=True)["y"].mean()
+
+
+def _churn_rate_by_level(series: pd.Series, churn: pd.Series) -> pd.Series:
+    """Compute mean churn per distinct level of a (typically binary) feature.
+
+    Parameters
+    ----------
+    series : pandas.Series
+        Feature values (e.g. 0/1).
+    churn : pandas.Series
+        Binary outcome (0/1), same index as series.
+
+    Returns
+    -------
+    pandas.Series
+        Index = feature levels, values = mean churn in that level.
+    """
+    use = pd.DataFrame({"x": series, "y": churn}).dropna(subset=["x"])
+    if use.empty:
+        return pd.Series(dtype=float)
+    return use.groupby("x", observed=True)["y"].mean().sort_index()
+
+
+def _rate_axis_limits(
+    values: pd.Series | np.ndarray,
+    min_range: float = 0.08,
+    padding_frac: float = 0.15,
+) -> tuple[float, float]:
+    """Compute y-axis limits for rate (0-1) bar charts so small differences are visible.
+
+    Parameters
+    ----------
+    values : pandas.Series or numpy array
+        Rate values in [0, 1].
+    min_range : float, optional
+        Minimum y-axis span (default 0.08) so narrow ranges are visible.
+    padding_frac : float, optional
+        Fraction of data range added as padding (default 0.15).
+
+    Returns
+    -------
+    tuple of (float, float)
+        (y_min, y_max) clipped to [0, 1].
+    """
+    vals = np.asarray(values, dtype=float)
+    if vals.size == 0:
+        return 0.0, 1.0
+    lo, hi = float(np.nanmin(vals)), float(np.nanmax(vals))
+    r = hi - lo
+    if r < 1e-9:
+        mid = lo
+        half = min_range / 2
+        return max(0.0, mid - half), min(1.0, mid + half)
+    pad = max(r * padding_frac, 0.02)
+    if r < min_range:
+        pad = max(pad, (min_range - r) / 2)
+    y_min = max(0.0, lo - pad)
+    y_max = min(1.0, hi + pad)
+    if y_max - y_min < min_range:
+        mid = (y_min + y_max) / 2
+        y_min = max(0.0, mid - min_range / 2)
+        y_max = min(1.0, mid + min_range / 2)
+    return y_min, y_max
+
+
+def plot_bivariate_churn_grid(
+    df: pd.DataFrame,
+    feature_cols: list[str],
+    target_col: str = "churn",
+    n_deciles: int = 10,
+    figsize: tuple[float, float] = (12, 5),
+) -> None:
+    """Plot bivariate vs churn: one figure per feature for readability.
+
+    For each feature: left = churn rate by decile (or by level if binary); right = box plot by churn.
+    Binary features (≤2 unique values) show only the left plot (two bars). Bar plot y-axes are scaled
+    to the data range (with minimum range) so small rate differences are visible.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Must contain feature_cols and target_col (e.g. churn 0/1).
+    feature_cols : list of str
+        Column names to plot.
+    target_col : str, optional
+        Binary outcome column (default "churn").
+    n_deciles : int, optional
+        Number of bins for non-binary features (default 10).
+    figsize : tuple of (float, float), optional
+        (width, height) per single-feature figure (default (12, 5)).
+
+    Returns
+    -------
+    None
+    """
+    # Palette for box plot: use hue=target_col so palette is applied; keys must match data dtype.
+    palette = {"0": "lightsteelblue", "1": "coral"}
+
+    for col in feature_cols:
+        use = df[[col, target_col]].dropna()
+        if use.empty:
+            fig, (ax_dec, ax_box) = plt.subplots(1, 2, figsize=figsize)
+            ax_dec.set_title(f"{col} (no data)")
+            ax_box.set_title(f"{col} (no data)")
+            plt.tight_layout()
+            plt.show()
+            continue
+
+        n_unique = use[col].nunique()
+        is_binary = n_unique <= 2
+
+        # Binary: single plot (churn rate by level only). Non-binary: two panels (decile + box).
+        if is_binary:
+            fig, ax_dec = plt.subplots(1, 1, figsize=(6, figsize[1]))
+            ax_box = None
+        else:
+            fig, (ax_dec, ax_box) = plt.subplots(1, 2, figsize=figsize)
+
+        # Left: churn rate by decile or by level (binary); y-axis scaled to data so differences are visible.
+        if is_binary:
+            rate_by_level = _churn_rate_by_level(use[col], use[target_col])
+            if rate_by_level.empty:
+                ax_dec.set_title(f"{col} (no data)")
+            else:
+                labels = [str(i) for i in rate_by_level.index]
+                x_pos = range(len(rate_by_level))
+                ax_dec.bar(x_pos, rate_by_level.values, color="steelblue", edgecolor="black", alpha=0.85)
+                ax_dec.set_xticks(x_pos)
+                ax_dec.set_xticklabels(labels, fontsize=11)
+                y_lo, y_hi = _rate_axis_limits(rate_by_level.values)
+                ax_dec.set_ylim(y_lo, y_hi)
+                ax_dec.set_ylabel("Churn rate", fontsize=10)
+                ax_dec.set_title(f"{col}: churn rate by level (binary)", fontsize=11)
+        else:
+            rate_by_dec = _churn_rate_by_decile(use[col], use[target_col], n_deciles=n_deciles)
+            if rate_by_dec.empty:
+                ax_dec.set_title(f"{col} (no bins)")
+            else:
+                n_bars = len(rate_by_dec)
+                x_pos = range(n_bars)
+                ax_dec.bar(x_pos, rate_by_dec.values, color="steelblue", edgecolor="black", alpha=0.85)
+                ax_dec.set_xticks(x_pos)
+                ax_dec.set_xticklabels([f"D{i+1}" for i in range(n_bars)], fontsize=9)
+                y_lo, y_hi = _rate_axis_limits(rate_by_dec.values)
+                ax_dec.set_ylim(y_lo, y_hi)
+                ax_dec.set_ylabel("Churn rate", fontsize=10)
+                ax_dec.set_title(f"{col}: churn rate by decile", fontsize=11)
+
+        # Right: box plot by churn (only for non-binary)
+        if ax_box is not None:
+            use_box = use.copy()
+            use_box[target_col] = use_box[target_col].astype(str)
+            sns.boxplot(
+                data=use_box, x=target_col, y=col, hue=target_col, legend=False, ax=ax_box,
+                palette=palette,
+            )
+            ax_box.set_title(f"{col}: distribution by churn", fontsize=11)
+            ax_box.set_xlabel(target_col, fontsize=10)
+            ax_box.set_ylabel(col, fontsize=10)
+            fig.subplots_adjust(left=0.08, right=0.95, top=0.88, bottom=0.12, wspace=0.28)
+        else:
+            fig.subplots_adjust(left=0.12, right=0.95, top=0.88, bottom=0.12)
+        plt.show()
 
 
 def build_claims_labels(
@@ -975,6 +1419,246 @@ def build_recency_tenure(
     ).astype(int)
     out = out.set_index("member_id").drop(columns=["signup_date"])
     return out, ref_date
+
+
+def build_member_aggregates(
+    members_df: pd.DataFrame,
+    app_df: pd.DataFrame,
+    web_df: pd.DataFrame,
+    claims_df: pd.DataFrame,
+    ref_date: pd.Timestamp | None = None,
+    focus_icd_codes: list[str] | None = None,
+    *,
+    wellco_embedding: np.ndarray | None = None,
+    embed_model: "ST" | None = None,
+    similarity_threshold: float = SIMILARITY_THRESHOLD,
+) -> pd.DataFrame:
+    """Build per-member aggregates for EDA: all-visit and WellCo-relevant web, app, claims, tenure.
+
+    One row per member from members_df. Count columns (n_sessions, n_web_visits, n_claims, etc.)
+    are set to 0 when the member has no rows in the source table (no event = zero count, not missing).
+    Only days_since_* and similar recency columns can be NaN when there is no event (true missing).
+    Includes days_since_signup; when wellco_embedding and embed_model are provided, also filters
+    web visits by WellCo relevance and adds wellco_web_visits_count and days_since_last_wellco_web.
+
+    Parameters
+    ----------
+    members_df : pd.DataFrame
+        Must have member_id; signup_date required for days_since_signup.
+    app_df, web_df, claims_df : pd.DataFrame
+        Raw event tables (app: member_id, timestamp; web: member_id, timestamp, title, description; claims: member_id, diagnosis_date, icd_code).
+    ref_date : pd.Timestamp or None, optional
+        Reference date for recency. If None, derived from max of event tables.
+    focus_icd_codes : list of str or None, optional
+        ICD codes to count as focus. If None, uses FOCUS_ICD_CODES.
+    wellco_embedding : np.ndarray or None, optional
+        Pre-computed WellCo brief embedding (1, dim). If None, WellCo web columns are omitted.
+    embed_model : SentenceTransformer or None, optional
+        Pre-loaded embedding model. Required with wellco_embedding for WellCo web features.
+    similarity_threshold : float, optional
+        Cosine-similarity cutoff for WellCo-relevant visits (default SIMILARITY_THRESHOLD).
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per member with columns: member_id, days_since_signup, n_sessions,
+        has_app_usage, days_since_last_session, n_web_visits, has_web_visits,
+        days_since_last_visit, n_distinct_titles, wellco_web_visits_count,
+        days_since_last_wellco_web (if WellCo args provided), n_claims, icd_distinct_count,
+        has_claims, days_since_last_claim, n_focus_icd_claims, has_focus_icd.
+    """
+    if ref_date is None:
+        ref_date = ref_date_from_tables(web_df, app_df, claims_df)
+    if focus_icd_codes is None:
+        focus_icd_codes = FOCUS_ICD_CODES
+
+    members = members_df[["member_id"]].drop_duplicates()
+
+    # Days since signup (tenure)
+    if "signup_date" in members_df.columns:
+        signup = members_df[["member_id", "signup_date"]].drop_duplicates("member_id")
+        members = members.merge(signup, on="member_id", how="left")
+        members["days_since_signup"] = (
+            ref_date - pd.to_datetime(members["signup_date"], errors="coerce")
+        ).dt.days
+        members = members.drop(columns=["signup_date"])
+    else:
+        members["days_since_signup"] = np.nan
+
+    # App: count, has_any, last timestamp
+    app_agg = app_df.groupby("member_id").agg(
+        n_sessions=("timestamp", "count"),
+        last_app=("timestamp", "max"),
+    )
+    members = members.merge(app_agg, on="member_id", how="left")
+    # No row in app_df means count = 0, not missing (unlike days_since_*, which is truly unknown).
+    members["n_sessions"] = members["n_sessions"].fillna(0).astype(int)
+    members["has_app_usage"] = members["n_sessions"].gt(0).astype(int)
+    members["days_since_last_session"] = (
+        ref_date - members["last_app"]
+    ).dt.days.where(members["last_app"].notna())
+    members = members.drop(columns=["last_app"])
+
+    # Web (all visits): count, has_any, last timestamp, n_distinct_titles
+    web_agg = web_df.groupby("member_id").agg(
+        n_web_visits=("timestamp", "count"),
+        last_web=("timestamp", "max"),
+    )
+    if "title" in web_df.columns:
+        web_agg["n_distinct_titles"] = web_df.groupby("member_id")["title"].nunique()
+    members = members.merge(web_agg, on="member_id", how="left")
+    # No row in web_df means count = 0, not missing.
+    members["n_web_visits"] = members["n_web_visits"].fillna(0).astype(int)
+    members["has_web_visits"] = members["n_web_visits"].gt(0).astype(int)
+    members["days_since_last_visit"] = (
+        ref_date - members["last_web"]
+    ).dt.days.where(members["last_web"].notna())
+    members = members.drop(columns=["last_web"])
+    if "n_distinct_titles" not in members.columns:
+        members["n_distinct_titles"] = 0
+    else:
+        members["n_distinct_titles"] = members["n_distinct_titles"].fillna(0).astype(int)
+
+    # WellCo-relevant web: embed + filter, then wellco_web_visits_count, days_since_last_wellco_web
+    if wellco_embedding is not None and embed_model is not None:
+        web_relevant = filter_wellco_relevant_visits(
+            web_df,
+            wellco_embedding=wellco_embedding,
+            embed_model=embed_model,
+            similarity_threshold=similarity_threshold,
+            ref_date=ref_date,
+        )
+        if web_relevant.empty:
+            members["wellco_web_visits_count"] = 0
+            members["days_since_last_wellco_web"] = np.nan
+        else:
+            wdf = web_relevant[web_relevant["timestamp"] <= ref_date]
+            if wdf.empty:
+                members["wellco_web_visits_count"] = 0
+                members["days_since_last_wellco_web"] = np.nan
+            else:
+                wellco_agg = (
+                    wdf.groupby("member_id")
+                    .agg(
+                        wellco_web_visits_count=("timestamp", "count"),
+                        _last_wellco=("timestamp", "max"),
+                    )
+                    .reset_index()
+                )
+                wellco_agg["days_since_last_wellco_web"] = (
+                    ref_date - wellco_agg["_last_wellco"]
+                ).dt.days
+                wellco_agg = wellco_agg.drop(columns=["_last_wellco"])
+                members = members.merge(wellco_agg, on="member_id", how="left")
+                members["wellco_web_visits_count"] = (
+                    members["wellco_web_visits_count"].fillna(0).astype(int)
+                )
+
+    # Claims: count, icd_distinct_count, has_any, last diagnosis_date, focus ICD counts
+    claims_agg = claims_df.groupby("member_id").agg(
+        n_claims=("diagnosis_date", "count"),
+        last_claim=("diagnosis_date", "max"),
+    )
+    if "icd_code" in claims_df.columns:
+        claims_agg["icd_distinct_count"] = claims_df.groupby("member_id")["icd_code"].nunique()
+        focus = claims_df[claims_df["icd_code"].isin(focus_icd_codes)]
+        focus_agg = focus.groupby("member_id").size().rename("n_focus_icd_claims")
+        claims_agg = claims_agg.join(focus_agg, how="left")
+        claims_agg["n_focus_icd_claims"] = claims_agg["n_focus_icd_claims"].fillna(0).astype(int)
+        claims_agg["has_focus_icd"] = claims_agg["n_focus_icd_claims"].gt(0).astype(int)
+    members = members.merge(claims_agg, on="member_id", how="left")
+    # No row in claims_df means count = 0, not missing.
+    members["n_claims"] = members["n_claims"].fillna(0).astype(int)
+    members["has_claims"] = members["n_claims"].gt(0).astype(int)
+    members["days_since_last_claim"] = (
+        ref_date - members["last_claim"]
+    ).dt.days.where(members["last_claim"].notna())
+    members = members.drop(columns=["last_claim"])
+    if "n_focus_icd_claims" not in members.columns:
+        members["n_focus_icd_claims"] = 0
+        members["has_focus_icd"] = 0
+    else:
+        members["n_focus_icd_claims"] = members["n_focus_icd_claims"].fillna(0).astype(int)
+        members["has_focus_icd"] = members["n_focus_icd_claims"].gt(0).astype(int)
+    if "icd_distinct_count" not in members.columns:
+        members["icd_distinct_count"] = 0
+    else:
+        members["icd_distinct_count"] = members["icd_distinct_count"].fillna(0).astype(int)
+
+    return members
+
+
+def verify_member_aggregates(
+    member_agg: pd.DataFrame,
+    members_df: pd.DataFrame,
+    app_df: pd.DataFrame,
+    web_df: pd.DataFrame,
+    claims_df: pd.DataFrame,
+    log_path: Path | str | None = None,
+) -> dict:
+    """Verify build_member_aggregates: one row per member, counts match raw tables; count cols are 0 when absent.
+
+    Writes NDJSON to log_path if provided. Returns a dict of check results (ok: bool, details).
+
+    Parameters
+    ----------
+    member_agg : pd.DataFrame
+        Output of build_member_aggregates (one row per member).
+    members_df, app_df, web_df, claims_df : pd.DataFrame
+        Inputs used to build member_agg (e.g. churn_labels, app_usage, web_visits, claims).
+    log_path : Path or str or None, optional
+        If set, append one NDJSON line with verification results.
+
+    Returns
+    -------
+    dict
+        Keys: row_count_ok, app_ok, web_ok, claims_ok, app_detail, web_detail, claims_detail, message.
+    """
+    import json as _json
+    base_ids = set(members_df["member_id"].unique())
+    agg_ids = set(member_agg["member_id"].unique())
+    row_count_ok = len(member_agg) == len(base_ids) and agg_ids == base_ids
+    app_counts = app_df.groupby("member_id").size().rename("_cnt")
+    web_counts = web_df.groupby("member_id").size().rename("_cnt")
+    claims_counts = claims_df.groupby("member_id").size().rename("_cnt")
+    # Count columns are 0 when member absent; when present, count must match raw table.
+    ma_app = member_agg.set_index("member_id")[["n_sessions"]].join(app_counts, how="left")
+    app_match = ((ma_app["_cnt"].isna() & (ma_app["n_sessions"] == 0)) | (ma_app["n_sessions"] == ma_app["_cnt"])).all()
+    app_zero_ok = ((~member_agg["member_id"].isin(app_df["member_id"])) & (member_agg["n_sessions"] != 0)).sum() == 0
+    app_ok = bool(app_match and app_zero_ok)
+    ma_web = member_agg.set_index("member_id")[["n_web_visits"]].join(web_counts, how="left")
+    web_match = ((ma_web["_cnt"].isna() & (ma_web["n_web_visits"] == 0)) | (ma_web["n_web_visits"] == ma_web["_cnt"])).all()
+    web_zero_ok = ((~member_agg["member_id"].isin(web_df["member_id"])) & (member_agg["n_web_visits"] != 0)).sum() == 0
+    web_ok = bool(web_match and web_zero_ok)
+    ma_claims = member_agg.set_index("member_id")[["n_claims"]].join(claims_counts, how="left")
+    claims_match = ((ma_claims["_cnt"].isna() & (ma_claims["n_claims"] == 0)) | (ma_claims["n_claims"] == ma_claims["_cnt"])).all()
+    claims_zero_ok = ((~member_agg["member_id"].isin(claims_df["member_id"])) & (member_agg["n_claims"] != 0)).sum() == 0
+    claims_ok = bool(claims_match and claims_zero_ok)
+    all_ok = row_count_ok and app_ok and web_ok and claims_ok
+    details = {
+        "row_count_ok": row_count_ok,
+        "app_ok": app_ok,
+        "web_ok": web_ok,
+        "claims_ok": claims_ok,
+        "app_match": bool(app_match),
+        "app_zero_ok": bool(app_zero_ok),
+        "web_match": bool(web_match),
+        "web_zero_ok": bool(web_zero_ok),
+        "claims_match": bool(claims_match),
+        "claims_zero_ok": bool(claims_zero_ok),
+        "n_members": len(member_agg),
+        "n_app_rows": len(app_df),
+        "n_web_rows": len(web_df),
+        "n_claims_rows": len(claims_df),
+    }
+    if log_path is not None:
+        try:
+            _payload = {"all_ok": all_ok, **details}
+            with open(log_path, "a", encoding="utf-8") as _f:
+                _f.write(_json.dumps(_payload, default=str) + "\n")
+        except Exception:
+            pass
+    return {"ok": all_ok, "details": details, "message": "OK" if all_ok else "One or more checks failed"}
 
 
 # ---------------------------------------------------------------------------
