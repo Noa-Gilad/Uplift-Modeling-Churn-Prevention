@@ -21,6 +21,7 @@ import seaborn as sns
 from scipy.stats import chi2_contingency, pearsonr
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
 
 try:
     from causalml.inference.meta import BaseSRegressor, BaseTRegressor
@@ -1662,8 +1663,127 @@ def verify_member_aggregates(
 
 
 # ---------------------------------------------------------------------------
-# Feature engineering pipeline
+# Feature engineering pipeline (per-member aggregates)
 # ---------------------------------------------------------------------------
+
+# Default 8 features used for modeling; recency columns use fixed bins 0 | 1-7 | >7.
+MEMBER_AGG_FEATURE_COLS = [
+    "days_since_signup",
+    "n_sessions",
+    "days_since_last_session",
+    "wellco_web_visits_count",
+    "days_since_last_wellco_web",
+    "n_claims",
+    "has_focus_icd",
+    "days_since_last_claim",
+]
+RECENCY_BIN_EDGES = (-0.1, 0.0, 7.0, np.inf)  # bins: 0 | 1-7 | >7
+RECENCY_BIN_LABELS = ("0", "1-7", ">7")
+# Descriptive suffixes for one-hot recency columns: 0 -> today, 1-7 -> last_week, >7 -> older.
+RECENCY_BIN_SUFFIXES = ("_today", "_last_week", "_older")
+# Base name per recency column so each variable's 3 binaries are clearly named (e.g. wellco_web_today).
+RECENCY_COL_BASES = {
+    "days_since_last_session": "session",
+    "days_since_last_wellco_web": "wellco_web",
+    "days_since_last_claim": "claim",
+}
+RECENCY_COLS = ("days_since_last_session", "days_since_last_wellco_web", "days_since_last_claim")
+
+
+def _apply_minmax(agg: pd.DataFrame, cols: list[str], reference: pd.DataFrame) -> pd.DataFrame:
+    """Apply Min-Max scaling using reference table for min/max. Returns scaled values."""
+    scaler = MinMaxScaler()
+    scaler.fit(reference[cols])
+    return pd.DataFrame(scaler.transform(agg[cols]), columns=cols, index=agg.index)
+
+
+def _apply_standard(agg: pd.DataFrame, col: str, reference: pd.DataFrame) -> pd.Series:
+    """Apply standardization (Z-score) using reference table for mean/std."""
+    scaler = StandardScaler()
+    scaler.fit(reference[[col]])
+    return pd.Series(scaler.transform(agg[[col]]).ravel(), index=agg.index, name=col)
+
+
+def _apply_recency_binning(series: pd.Series) -> pd.Series:
+    """Bin recency column into 0 | 1-7 | >7; NaN -> '>7'."""
+    binned = pd.cut(
+        series.fillna(np.inf),
+        bins=list(RECENCY_BIN_EDGES),
+        labels=list(RECENCY_BIN_LABELS),
+        include_lowest=True,
+    )
+    return binned.astype(str).replace("nan", ">7")
+
+
+def engineer_member_aggregates(
+    agg: pd.DataFrame,
+    reference_agg: pd.DataFrame | None = None,
+    feature_cols: list[str] | None = None,
+    out_path: Path | str | None = None,
+) -> pd.DataFrame:
+    """Engineer an aggregated table (member_id + 8 input features): scaling, log, recency one-hot.
+
+    Recency columns (days_since_last_*) are binned into 0 | 1-7 | >7 and one-hot encoded
+    into 3 binary columns each with descriptive names (e.g. wellco_web_today,
+    wellco_web_last_week, wellco_web_older; session_*, claim_*). Output has 14 engineered
+    feature columns (5 numeric + 9 recency binaries + has_focus_icd).
+
+    Call with reference_agg=None for train (scaling params from agg); call with
+    reference_agg=train_agg for test so scaling uses train statistics. Optionally
+    saves the result to out_path.
+
+    Parameters
+    ----------
+    agg : pandas.DataFrame
+        Per-member aggregate with member_id and the 8 feature columns (caller filters).
+    reference_agg : pandas.DataFrame or None, optional
+        If None, use agg for scaling params (train). If provided, use for scaling (test).
+    feature_cols : list of str or None, optional
+        Feature columns to engineer; default MEMBER_AGG_FEATURE_COLS.
+    out_path : path-like or None, optional
+        If set, save engineered table to CSV here.
+
+    Returns
+    -------
+    pandas.DataFrame
+        member_id plus engineered feature columns (14 feature columns after one-hot recency).
+    """
+    cols = feature_cols if feature_cols is not None else list(MEMBER_AGG_FEATURE_COLS)
+    ref = reference_agg if reference_agg is not None else agg
+    ref = ref[[c for c in cols if c in ref.columns]]
+    agg = agg[["member_id"] + [c for c in cols if c in agg.columns]].copy()
+    out = agg[["member_id"]].copy()
+
+    # Min-Max: days_since_signup, n_claims
+    minmax_cols = [c for c in ["days_since_signup", "n_claims"] if c in cols and c in agg.columns]
+    if minmax_cols:
+        out[minmax_cols] = _apply_minmax(agg, minmax_cols, ref)
+
+    # Standardization: n_sessions
+    if "n_sessions" in cols and "n_sessions" in agg.columns:
+        out["n_sessions"] = _apply_standard(agg, "n_sessions", ref)
+
+    # Log: wellco_web_visits_count
+    if "wellco_web_visits_count" in cols and "wellco_web_visits_count" in agg.columns:
+        out["wellco_web_visits_count"] = np.log1p(agg["wellco_web_visits_count"])
+
+    # Recency binning: 0 | 1-7 | >7, then one-hot encode into 3 binary columns per recency feature.
+    for col in RECENCY_COLS:
+        if col in cols and col in agg.columns:
+            binned = _apply_recency_binning(agg[col])
+            base = RECENCY_COL_BASES[col]
+            for label, suffix in zip(RECENCY_BIN_LABELS, RECENCY_BIN_SUFFIXES, strict=True):
+                out[base + suffix] = (binned == label).astype(int)
+
+    # Keep as-is: has_focus_icd
+    if "has_focus_icd" in cols and "has_focus_icd" in agg.columns:
+        out["has_focus_icd"] = agg["has_focus_icd"].values
+
+    if out_path is not None:
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+        out.to_csv(out_path, index=False)
+
+    return out
 
 
 def load_wellco_brief(path: Path | str) -> str:
