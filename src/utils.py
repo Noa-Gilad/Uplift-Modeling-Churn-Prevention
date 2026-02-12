@@ -4778,12 +4778,12 @@ def make_nan_free(
     return X_arr
 
 
-def extract_slearner_base_model(model):
-    """Extract the fitted base model from a CausalML S-Learner.
+def _extract_slearner_base_model(model):
+    """Extract the fitted base model from a CausalML S-Learner (internal helper).
 
-    CausalML's ``BaseSLearner.fit()`` stores fitted models in
-    ``self.models`` — a dict keyed by treatment group.  For binary
-    treatment there is exactly one key (typically 1).
+    CausalML's BaseSRegressor stores fitted models in ``self.models``
+    (dict keyed by treatment group). Used only in the S-learner branch
+    of compute_shap_uplift.
 
     Parameters
     ----------
@@ -4988,47 +4988,40 @@ def _is_tlearner(model) -> bool:
     )
 
 
-def compute_shap_uplift_slearner(
+def compute_shap_uplift(
     model,
     X: np.ndarray | pd.DataFrame,
     feature_names: list[str] | None = None,
     reference_X: np.ndarray | pd.DataFrame | None = None,
+    impute_nan: bool = False,
 ) -> tuple:
-    """Compute per-feature SHAP values for the **uplift** (−CATE) of an S- or T-Learner.
+    """Compute per-feature SHAP values for the **uplift** (−CATE) of any supported meta-learner.
 
-    **S-Learner:** One model predicts E[Y|X,T] with treatment as first column.
-    We run SHAP with T=0 and T=1 and set uplift_shap = SHAP(T=0) − SHAP(T=1) on features.
+    Supports **S-Learner** and **T-Learner** (and other CausalML meta-learners that expose
+    models_c/models_t or models). Tree-based (LGBM, XGB) and linear (Ridge/Lasso/ElasticNet) bases.
 
-    **T-Learner:** Two models (control and treatment) each take X only. We compute
-    SHAP for each and set uplift_shap = SHAP(control) − SHAP(treatment) so that
-    higher = more beneficial (same convention as −CATE).
+    A positive SHAP value = that feature pushes predicted uplift higher (more benefit from treatment).
 
-    Supports both tree-based (LGBM, XGB → TreeExplainer) and linear
-    (Ridge/Lasso/ElasticNet Pipeline → LinearExplainer) base models.
-
-    A positive SHAP value for a feature means *that feature pushes the
-    uplift higher for this user* (more beneficial treatment effect).
-
-    NaN handling: *X* is passed through ``make_nan_free`` (median impute)
-    using *reference_X* (or *X* itself) before computing SHAP.
+    **impute_nan:** If False (default), *X* is used as-is. If True, *X* is passed through
+    ``make_nan_free`` using *reference_X* before SHAP (use when inputs contain NaNs).
 
     Parameters
     ----------
-    model : BaseSRegressor or BaseTRegressor (fitted)
-        A fitted CausalML S- or T-Learner.
+    model : fitted CausalML meta-learner
+        e.g. BaseSRegressor, BaseTRegressor.
     X : np.ndarray or pd.DataFrame
-        Feature matrix (same columns as used in fit, **without** treatment).
+        Feature matrix (same columns as in fit, **without** treatment).
     feature_names : list[str] or None
-        Names for the features (columns of *X*).  If ``None``, uses
-        generic ``["f0", "f1", ...]``.
+        Names for the features. If ``None``, uses ``["f0", "f1", ...]``.
     reference_X : np.ndarray or pd.DataFrame or None
-        Reference data for NaN imputation medians (e.g. full training set).
-        If ``None``, medians are computed from *X*.
+        Used only when impute_nan=True for median imputation reference.
+    impute_nan : bool, default False
+        If True, impute NaNs in X with column medians before SHAP. If False, use X as-is.
 
     Returns
     -------
     shap_values_matrix : np.ndarray, shape (n_samples, n_features)
-        Per-feature SHAP values for the retention uplift (−CATE).
+        Per-feature SHAP values for retention uplift (−CATE).
     feature_names : list[str]
         Feature names aligned with columns of *shap_values_matrix*.
     expected_uplift : float
@@ -5037,7 +5030,12 @@ def compute_shap_uplift_slearner(
     if shap is None:
         raise ImportError("shap package is required. Install with: pip install shap")
 
-    X_clean = make_nan_free(X, reference=reference_X)
+    if impute_nan and reference_X is not None:
+        X_clean = make_nan_free(X, reference=reference_X)
+    elif impute_nan:
+        X_clean = make_nan_free(X, reference=X)
+    else:
+        X_clean = np.asarray(X, dtype=np.float64) if not isinstance(X, np.ndarray) else X
     n = X_clean.shape[0]
 
     if _is_tlearner(model):
@@ -5071,7 +5069,7 @@ def compute_shap_uplift_slearner(
         expected_uplift = float(np.mean(base_c) - np.mean(base_t))
     else:
         # S-Learner: single model with [T | X]
-        base_model = extract_slearner_base_model(model)
+        base_model = _extract_slearner_base_model(model)
         X_t1 = np.hstack([np.ones((n, 1)), X_clean])
         X_t0 = np.hstack([np.zeros((n, 1)), X_clean])
 
@@ -5102,6 +5100,10 @@ def compute_shap_uplift_slearner(
     return uplift_shap, list(feature_names), expected_uplift
 
 
+# Backward-compatibility alias (name referred to S-learner; function supports all meta-learners).
+compute_shap_uplift_slearner = compute_shap_uplift
+
+
 def plot_shap_importance_bar(
     shap_values: np.ndarray,
     feature_names: list[str],
@@ -5115,7 +5117,7 @@ def plot_shap_importance_bar(
     Parameters
     ----------
     shap_values : np.ndarray, shape (n_samples, n_features)
-        SHAP values matrix (e.g. from ``compute_shap_uplift_slearner``).
+        SHAP values matrix (e.g. from ``compute_shap_uplift``).
     feature_names : list[str]
         Feature names aligned with columns of *shap_values*.
     title : str
@@ -5313,11 +5315,11 @@ def compute_parshap_overfitting(
     model_clone = deepcopy(model)
     model_clone.fit(X_tr, t_tr, y_tr)
     # Compute SHAP on train and holdout using the clone
-    shap_tr, _, _ = compute_shap_uplift_slearner(
-        model_clone, X_tr, feature_names=feature_names, reference_X=reference_X
+    shap_tr, _, _ = compute_shap_uplift(
+        model_clone, X_tr, feature_names=feature_names, reference_X=reference_X, impute_nan=True
     )
-    shap_ho, _, _ = compute_shap_uplift_slearner(
-        model_clone, X_ho, feature_names=feature_names, reference_X=reference_X
+    shap_ho, _, _ = compute_shap_uplift(
+        model_clone, X_ho, feature_names=feature_names, reference_X=reference_X, impute_nan=True
     )
     shap_tr = np.asarray(shap_tr).squeeze()
     shap_ho = np.asarray(shap_ho).squeeze()
