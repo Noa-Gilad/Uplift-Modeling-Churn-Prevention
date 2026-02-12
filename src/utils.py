@@ -2578,22 +2578,19 @@ def assign_segments(
     return seg
 
 
-def predict_baseline_slearner(
+def predict_baseline_control(
     model,
     X: np.ndarray | pd.DataFrame,
 ) -> np.ndarray:
-    """Extract P(Y | X, T=0) — the control/baseline prediction from a fitted S-Learner.
+    """Extract P(Y | X, T=0) — the control/baseline prediction from a fitted meta-learner.
 
-    CausalML's ``BaseSLearner.fit()`` stores fitted models in
-    ``self.models``  — a dict keyed by treatment group.  Each model was
-    trained on ``[treatment_indicator | X]`` (treatment **prepended** as
-    the first column).  To obtain the baseline (control) prediction we
-    build ``[0 | X]`` and call the fitted model's ``.predict()``.
+    Supports S-Learner, T-Learner, and other CausalML meta-learners that expose
+    either ``models_c`` (T-learner control model) or ``models`` (S-learner single model).
 
     Parameters
     ----------
-    model : BaseSRegressor (fitted)
-        A fitted CausalML S-Learner.
+    model : fitted CausalML meta-learner
+        e.g. BaseSRegressor, BaseTRegressor (fitted).
     X : np.ndarray or pd.DataFrame
         Feature matrix (same columns used during ``.fit()``, **without**
         the treatment indicator).
@@ -2605,21 +2602,35 @@ def predict_baseline_slearner(
     """
     X_arr = np.asarray(X)
     n = X_arr.shape[0]
-    # CausalML BaseSLearner stores fitted models in self.models (dict),
-    # keyed by treatment group.  For binary treatment the only key is
-    # the treatment value (e.g. 1).  self.model is the *unfitted* template.
+
+    # T-Learner: control and treatment models stored in models_c and models_t (X only).
+    models_c = getattr(model, "models_c", None)
+    models_t = getattr(model, "models_t", None)
+    if models_c is not None and models_t is not None and len(models_c) > 0:
+        t_groups = getattr(model, "t_groups", None)
+        if t_groups is None or len(t_groups) == 0:
+            group = next(iter(models_c))
+        else:
+            group = t_groups[0]
+        control_model = models_c[group]
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="X does not have valid feature names",
+                category=UserWarning,
+                module="sklearn.utils.validation",
+            )
+            return np.asarray(control_model.predict(X_arr)).ravel()
+    # S-Learner: single model in self.models, trained on [T | X].
     fitted_models = getattr(model, "models", None)
     if fitted_models is None or len(fitted_models) == 0:
         raise AttributeError(
-            "Cannot find fitted internal models on the S-Learner. "
-            "Expected attribute 'models' (dict). Has fit() been called?"
+            "Cannot find fitted internal models. Expected 'models_c' (T-learner) or "
+            "'models' (S-learner). Has fit() been called?"
         )
-    # Use the first (and typically only) treatment group's model
     group_key = next(iter(fitted_models))
     base_model = fitted_models[group_key]
-    # CausalML *prepends* treatment as the first column: [T | X]
     X_control = np.hstack([np.zeros((n, 1)), X_arr])
-    # LGBM was fitted with feature names (DataFrame); passing numpy triggers sklearn warning — suppress it
     with warnings.catch_warnings():
         warnings.filterwarnings(
             "ignore",
@@ -2628,6 +2639,10 @@ def predict_baseline_slearner(
             module="sklearn.utils.validation",
         )
         return base_model.predict(X_control)
+
+
+# Backward-compatibility alias (name referred to S-learner only; function supports all learners).
+predict_baseline_slearner = predict_baseline_control
 
 
 def build_model(
