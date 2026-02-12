@@ -1520,14 +1520,19 @@ def _make_linear_learner(base_key: str, base_params: dict | None = None) -> obje
 
     if base_key == "Ridge":
         from sklearn.linear_model import Ridge
+        # Default alpha=1.0 is fine for Ridge; no change.
         model = Ridge(**params)
     elif base_key == "Lasso":
         from sklearn.linear_model import Lasso
-        # Lasso default max_iter may not converge; increase if not set
+        # sklearn default alpha=1.0 often zeros all coefs on weak signals → constant predictions.
+        # Use a gentler default so Section 5 CV differentiates Lasso from Ridge/ElasticNet.
+        params.setdefault("alpha", 0.1)
         params.setdefault("max_iter", 10000)
         model = Lasso(**params)
     elif base_key == "ElasticNet":
         from sklearn.linear_model import ElasticNet
+        params.setdefault("alpha", 0.1)
+        params.setdefault("l1_ratio", 0.5)  # explicit mix so it differs from Lasso (1.0) and Ridge (0)
         params.setdefault("max_iter", 10000)
         model = ElasticNet(**params)
     else:
