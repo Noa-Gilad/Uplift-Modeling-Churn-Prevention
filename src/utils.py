@@ -2742,6 +2742,68 @@ def qini_coefficient(
         return np.nan
 
 
+def evaluate_uplift_metrics(
+    y: np.ndarray,
+    treatment: np.ndarray,
+    cate: np.ndarray,
+    k_fracs: list[float] | None = None,
+    n_points: int = 100,
+    print_result: bool = True,
+) -> dict:
+    """Compute AUUC, Qini, and uplift@k from raw CATE predictions (churn convention).
+
+    Uses negated CATE as the scoring signal (higher = more benefit from treatment).
+    Qini is computed with retention labels (1 - y) and negated CATE.
+
+    Parameters
+    ----------
+    y : np.ndarray
+        Churn labels (0/1).
+    treatment : np.ndarray
+        Treatment indicator (1 = treated, 0 = control).
+    cate : np.ndarray
+        Raw CATE from the model (churn CATE; will be negated for scoring).
+    k_fracs : list of float or None
+        Fractions for uplift@k (e.g. [0.10, 0.20]). Default [0.10, 0.20].
+    n_points : int
+        Number of points for the uplift curve (AUUC). Default 100.
+    print_result : bool
+        If True, print AUUC, Qini, and uplift@k for each fraction. Default True.
+
+    Returns
+    -------
+    dict
+        Keys: auuc, qini_coefficient, uplift_at_k (dict k_frac -> value), ks, uplift_vals.
+    """
+    if k_fracs is None:
+        k_fracs = [0.10, 0.20]
+    cate = np.asarray(cate).ravel()
+    uplift_scores = -cate
+    y_ret = 1 - np.asarray(y).ravel()
+
+    qini = qini_coefficient(y_ret, treatment, uplift_scores)
+    ks, uplift_vals = uplift_curve(y, treatment, uplift_scores, n_points=n_points)
+    auuc = approx_auuc(ks, uplift_vals)
+    uplift_at_k_vals = {
+        k: uplift_at_k(y, treatment, uplift_scores, k=k) for k in k_fracs
+    }
+
+    if print_result:
+        print("Training-set evaluation (final model on full train):")
+        print(f"  AUUC              : {auuc:.4f}")
+        print(f"  Qini coefficient  : {qini:.4f}")
+        for k in k_fracs:
+            print(f"  Uplift@{int(k * 100)}%        : {uplift_at_k_vals[k]:.4f}")
+
+    return {
+        "auuc": auuc,
+        "qini_coefficient": qini,
+        "uplift_at_k": uplift_at_k_vals,
+        "ks": ks,
+        "uplift_vals": uplift_vals,
+    }
+
+
 # Default colors for Qini curve plots (same order as typical use: models then Random).
 # Matplotlib default cycle first 4 + gray for baseline.
 QINI_CURVE_COLORS = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"]
@@ -3438,6 +3500,50 @@ def select_best_uplift_model(
 # ---------------------------------------------------------------------------
 # Hyperparameter Tuning — Grid Search (Section 6)
 # ---------------------------------------------------------------------------
+
+
+def get_uplift_hp_grid(base_key: str) -> dict[str, list]:
+    """Return the default hyperparameter grid for uplift grid search by base learner.
+
+    Ridge/Lasso/ElasticNet use alpha (and for Lasso/ElasticNet: max_iter; for ElasticNet: l1_ratio).
+    LGBM uses a grid tuned for less overfitting (shallower trees, stronger regularization).
+
+    Parameters
+    ----------
+    base_key : str
+        One of 'Ridge', 'Lasso', 'ElasticNet', 'LGBM'.
+
+    Returns
+    -------
+    dict[str, list]
+        param_grid suitable for run_uplift_hp_grid_search (keys = param names, values = lists).
+    """
+    if base_key == "Ridge":
+        return {"alpha": [0.001, 0.01, 0.1, 1.0, 10, 100, 1000]}
+    if base_key == "Lasso":
+        return {
+            "alpha": [0.001, 0.01, 0.1, 1.0, 10, 100, 1000],
+            "max_iter": [5000, 10000],
+        }
+    if base_key == "ElasticNet":
+        return {
+            "alpha": [0.001, 0.01, 0.1, 1.0, 10, 100],
+            "l1_ratio": [0.1, 0.25, 0.5, 0.75, 0.9],
+            "max_iter": [5000, 10000],
+        }
+    if base_key == "LGBM":
+        return {
+            "max_depth": [3, 4],
+            "learning_rate": [0.05, 0.1],
+            "min_child_samples": [20, 40, 60],
+            "reg_alpha": [1, 10, 50],
+            "reg_lambda": [5, 10, 20],
+            "bagging_fraction": [0.8, 1.0],
+            "bagging_freq": [1],
+            "feature_fraction": [0.8, 1.0],
+            "min_gain_to_split": [0.1, 0.2, 0.3],
+        }
+    raise ValueError(f"Unknown base_key for HP grid: {base_key!r}. Use one of Ridge, Lasso, ElasticNet, LGBM.")
 
 
 def run_uplift_hp_grid_search(
@@ -4859,22 +4965,28 @@ def _shap_explain(explainer, base_model, X_data: np.ndarray) -> object:
         return explainer(X_data)
 
 
+def _is_tlearner(model) -> bool:
+    """Return True if the model is a CausalML T-learner (has models_c and models_t)."""
+    return (
+        getattr(model, "models_c", None) is not None
+        and getattr(model, "models_t", None) is not None
+    )
+
+
 def compute_shap_uplift_slearner(
     model,
     X: np.ndarray | pd.DataFrame,
     feature_names: list[str] | None = None,
     reference_X: np.ndarray | pd.DataFrame | None = None,
 ) -> tuple:
-    """Compute per-feature SHAP values for the **uplift** (−CATE) of an S-Learner.
+    """Compute per-feature SHAP values for the **uplift** (−CATE) of an S- or T-Learner.
 
-    The S-Learner's internal model predicts ``E[Y | X, T]`` with
-    treatment prepended as the first column.  To decompose the *uplift*
-    into per-feature contributions we:
+    **S-Learner:** One model predicts E[Y|X,T] with treatment as first column.
+    We run SHAP with T=0 and T=1 and set uplift_shap = SHAP(T=0) − SHAP(T=1) on features.
 
-    1. Run SHAP explainer with ``T = 1`` for every row → ``shap_t1``.
-    2. Run SHAP explainer with ``T = 0`` for every row → ``shap_t0``.
-    3. ``shap_uplift = shap_t0[:, 1:] − shap_t1[:, 1:]``
-       (feature columns only, negated for −CATE = retention uplift).
+    **T-Learner:** Two models (control and treatment) each take X only. We compute
+    SHAP for each and set uplift_shap = SHAP(control) − SHAP(treatment) so that
+    higher = more beneficial (same convention as −CATE).
 
     Supports both tree-based (LGBM, XGB → TreeExplainer) and linear
     (Ridge/Lasso/ElasticNet Pipeline → LinearExplainer) base models.
@@ -4883,13 +4995,12 @@ def compute_shap_uplift_slearner(
     uplift higher for this user* (more beneficial treatment effect).
 
     NaN handling: *X* is passed through ``make_nan_free`` (median impute)
-    using *reference_X* (or *X* itself) before computing SHAP, because
-    SHAP TreeExplainer can produce NaN SHAP values on NaN inputs.
+    using *reference_X* (or *X* itself) before computing SHAP.
 
     Parameters
     ----------
-    model : BaseSRegressor (fitted)
-        A fitted CausalML S-Learner.
+    model : BaseSRegressor or BaseTRegressor (fitted)
+        A fitted CausalML S- or T-Learner.
     X : np.ndarray or pd.DataFrame
         Feature matrix (same columns as used in fit, **without** treatment).
     feature_names : list[str] or None
@@ -4911,42 +5022,64 @@ def compute_shap_uplift_slearner(
     if shap is None:
         raise ImportError("shap package is required. Install with: pip install shap")
 
-    base_model = extract_slearner_base_model(model)
     X_clean = make_nan_free(X, reference=reference_X)
     n = X_clean.shape[0]
 
-    # Build augmented matrices: [T | X]
-    X_t1 = np.hstack([np.ones((n, 1)), X_clean])   # treatment = 1
-    X_t0 = np.hstack([np.zeros((n, 1)), X_clean])   # treatment = 0
+    if _is_tlearner(model):
+        # T-Learner: two models (control and treatment), each takes X only. CATE = pred_t - pred_c.
+        # Uplift = −CATE = pred_c − pred_t, so uplift_shap = SHAP(model_c) − SHAP(model_t).
+        t_groups = getattr(model, "t_groups", None)
+        if t_groups is None or len(t_groups) == 0:
+            raise AttributeError("T-learner has no t_groups.")
+        group = t_groups[0]
+        model_c = model.models_c[group]
+        model_t = model.models_t[group]
+        # Background for explainers (X only)
+        explainer_c = _make_shap_explainer_for_base(model_c, X_clean)
+        explainer_t = _make_shap_explainer_for_base(model_t, X_clean)
+        shap_c = _shap_explain(explainer_c, model_c, X_clean)
+        shap_t = _shap_explain(explainer_t, model_t, X_clean)
+        vals_c = getattr(shap_c, "values", shap_c)
+        vals_t = getattr(shap_t, "values", shap_t)
+        vals_c = np.asarray(vals_c).squeeze()
+        vals_t = np.asarray(vals_t).squeeze()
+        if vals_c.ndim > 2:
+            vals_c = vals_c.reshape(vals_c.shape[0], -1)
+        if vals_t.ndim > 2:
+            vals_t = vals_t.reshape(vals_t.shape[0], -1)
+        # Uplift = −CATE = pred_c − pred_t → SHAP(uplift) = SHAP_c − SHAP_t
+        uplift_shap = vals_c - vals_t
+        base_c = getattr(shap_c, "base_values", np.array(0.0))
+        base_t = getattr(shap_t, "base_values", np.array(0.0))
+        base_c = np.asarray(base_c).ravel()
+        base_t = np.asarray(base_t).ravel()
+        expected_uplift = float(np.mean(base_c) - np.mean(base_t))
+    else:
+        # S-Learner: single model with [T | X]
+        base_model = extract_slearner_base_model(model)
+        X_t1 = np.hstack([np.ones((n, 1)), X_clean])
+        X_t0 = np.hstack([np.zeros((n, 1)), X_clean])
 
-    # Create appropriate SHAP explainer (tree or linear) using T=0 background
-    explainer = _make_shap_explainer_for_base(base_model, X_t0)
+        explainer = _make_shap_explainer_for_base(base_model, X_t0)
+        shap_t1 = _shap_explain(explainer, base_model, X_t1)
+        shap_t0 = _shap_explain(explainer, base_model, X_t0)
 
-    # Run SHAP on both treatment conditions
-    shap_t1 = _shap_explain(explainer, base_model, X_t1)
-    shap_t0 = _shap_explain(explainer, base_model, X_t0)
+        vals_t1 = getattr(shap_t1, "values", shap_t1)
+        vals_t0 = getattr(shap_t0, "values", shap_t0)
+        vals_t1 = np.asarray(vals_t1).squeeze()
+        vals_t0 = np.asarray(vals_t0).squeeze()
+        if vals_t1.ndim > 2:
+            vals_t1 = vals_t1.reshape(vals_t1.shape[0], -1)
+        if vals_t0.ndim > 2:
+            vals_t0 = vals_t0.reshape(vals_t0.shape[0], -1)
 
-    # Handle both Explanation object (.values) and raw array (newer vs older SHAP API)
-    vals_t1 = getattr(shap_t1, "values", shap_t1)
-    vals_t0 = getattr(shap_t0, "values", shap_t0)
-    vals_t1 = np.asarray(vals_t1).squeeze()
-    vals_t0 = np.asarray(vals_t0).squeeze()
-    # Ensure 2D: (n_samples, n_features) — drop any trailing class dimension from multiclass
-    if vals_t1.ndim > 2:
-        vals_t1 = vals_t1.reshape(vals_t1.shape[0], -1)
-    if vals_t0.ndim > 2:
-        vals_t0 = vals_t0.reshape(vals_t0.shape[0], -1)
+        uplift_shap = vals_t0[:, 1:] - vals_t1[:, 1:]
 
-    # Uplift SHAP = SHAP(T=0) − SHAP(T=1) for feature columns (skip col 0 = treatment)
-    # This is because uplift = −CATE = E[Y|T=0] − E[Y|T=1], so higher = more beneficial.
-    uplift_shap = vals_t0[:, 1:] - vals_t1[:, 1:]
-
-    # Expected uplift (base value difference)
-    base_t1 = getattr(shap_t1, "base_values", np.array(0.0))
-    base_t0 = getattr(shap_t0, "base_values", np.array(0.0))
-    base_t1 = np.asarray(base_t1).ravel()
-    base_t0 = np.asarray(base_t0).ravel()
-    expected_uplift = float(np.mean(base_t0) - np.mean(base_t1))
+        base_t1 = getattr(shap_t1, "base_values", np.array(0.0))
+        base_t0 = getattr(shap_t0, "base_values", np.array(0.0))
+        base_t1 = np.asarray(base_t1).ravel()
+        base_t0 = np.asarray(base_t0).ravel()
+        expected_uplift = float(np.mean(base_t0) - np.mean(base_t1))
 
     if feature_names is None:
         feature_names = [f"f{i}" for i in range(X_clean.shape[1])]
