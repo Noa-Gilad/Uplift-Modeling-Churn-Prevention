@@ -1,0 +1,14 @@
+# Uplift churn modeling — dependencies (from src/utils.py and uplift_churn_run.ipynb)
+numpy
+pandas
+matplotlib
+seaborn
+scipy
+scikit-learn
+sentence-transformers
+causalml
+lightgbm
+xgboost
+shap
+ipython
+pathlib

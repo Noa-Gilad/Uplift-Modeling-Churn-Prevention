@@ -1,8 +1,10 @@
-# Only track files under src/ (and this .gitignore)
+# Only track files under src/ (and this .gitignore, README, requirements)
 # Ignore all files and directories at repo root
 /*
 !.gitignore
 !/src
+!README.md
+!requirements.txt
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -160,8 +162,9 @@ venv.bak/
 # mkdocs documentation
 /site
 
-# Markdown files
+# Markdown files (README.md is tracked)
 *.md
+!README.md
 
 # mypy
 .mypy_cache/
