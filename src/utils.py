@@ -2898,6 +2898,53 @@ def get_qini_curve_single(
         return frac, np.full(n_points, np.nan)
 
 
+def compute_qini_curve_with_baseline(
+    y: np.ndarray,
+    treatment: np.ndarray,
+    uplift_scores: np.ndarray,
+    n_points: int = 101,
+    random_state: int | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compute Qini curve and random-permutation baseline for one dataset.
+
+    Converts churn labels to retention (1 - y), computes the model Qini curve
+    and a random-baseline curve (scores = random permutation). Use for train
+    and holdout panels with the same logic.
+
+    Parameters
+    ----------
+    y : np.ndarray
+        Binary churn labels (0 = retained, 1 = churned).
+    treatment : np.ndarray
+        Treatment indicator (1 = treated, 0 = control).
+    uplift_scores : np.ndarray
+        Retention uplift scores (e.g. -CATE); higher = more retention benefit.
+    n_points : int
+        Number of fraction points for the curve grid. Default 101.
+    random_state : int or None
+        Seed for random permutation baseline. Defaults to RANDOM_STATE.
+
+    Returns
+    -------
+    frac : np.ndarray
+        Fraction of population targeted (0 to 1), shape (n_points,).
+    model_vals : np.ndarray
+        Qini curve values for the model, shape (n_points,).
+    random_vals : np.ndarray
+        Qini curve values for the random baseline, shape (n_points,).
+    """
+    if random_state is None:
+        random_state = RANDOM_STATE
+    y_ret = 1 - np.asarray(y).ravel()
+    frac, model_vals = get_qini_curve_single(
+        y_ret, treatment, np.asarray(uplift_scores).ravel(), n_points=n_points
+    )
+    rng = np.random.default_rng(random_state)
+    rand_scores = rng.permutation(np.arange(len(y_ret), dtype=float))
+    _, random_vals = get_qini_curve_single(y_ret, treatment, rand_scores, n_points=n_points)
+    return frac, model_vals, random_vals
+
+
 def aggregate_qini_curves_over_folds(
     curves_per_fold: list[tuple[np.ndarray, np.ndarray]],
     n_points: int = 101,
