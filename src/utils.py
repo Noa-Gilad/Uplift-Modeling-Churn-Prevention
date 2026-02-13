@@ -4387,6 +4387,7 @@ def compute_train_holdout_uplift_data(
     -------
     dict with keys:
         model_80 : fitted meta-learner on train portion
+        X_tr, X_ho : feature matrices for train and holdout (for baseline prediction)
         y_tr, treatment_tr, uplift_scores_tr : train portion labels and scores
         y_ho, treatment_ho, uplift_scores_ho : holdout portion labels and scores
         ks_tr, uplift_vals_tr : cumulative uplift curve (train)
@@ -4433,6 +4434,8 @@ def compute_train_holdout_uplift_data(
 
     return {
         "model_80": model_80,
+        "X_tr": X_tr,
+        "X_ho": X_ho,
         "y_tr": y_tr,
         "treatment_tr": treatment_tr,
         "uplift_scores_tr": uplift_scores_tr,
