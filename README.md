@@ -99,7 +99,7 @@ Run from the **`src/`** directory (so that paths resolve correctly).
   - **Why top 10%:** The top 10% was selected as the primary recommended outreach size because: (1) it lies within the region of highest marginal uplift on holdout (e.g. holdout Uplift@10% 0.1330 vs Uplift@20% 0.0958); (2) it generalises consistently from train to holdout; (3) it avoids the flattening region where incremental benefit diminishes; (4) it minimises exposure to segments with weak or potentially negative uplift. With constant marginal cost, optimal *n* is the largest prefix of the ranked list where expected incremental gain remains clearly positive and stable—the top 10% satisfies this and is reported as the primary targeting recommendation.
   - **Export:** The notebook exports a configurable top fraction (default 10%), allowing *n* to be adjusted for business cost assumptions or operational constraints.
 
-- **Using outreach in modeling:** The outreach event (between observation and churn window) is the **treatment**. The model is trained on labeled data with treatment/control and predicts CATE; the prioritization score is the predicted uplift (retention gain), so the list favors “persuadables.”
+- **Using outreach in modeling:** The outreach event (between observation and churn window) is the **treatment**. A T-learner is used: separate outcome models are fitted for control and treated units, and CATE is estimated as the difference between the two predictions. The model is trained on labeled data with treatment/control and predicts CATE; the prioritization score is the predicted uplift (retention gain), so the ranked list favors “persuadables.”
 
 ---
 
