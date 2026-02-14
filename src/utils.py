@@ -19,8 +19,17 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy.stats import chi2_contingency, pearsonr
-from sklearn.linear_model import LinearRegression
+import builtins
+import itertools
+import json
+import tempfile
+from copy import deepcopy
+
+from matplotlib.colors import Normalize
+from sklearn.linear_model import LinearRegression, Ridge, Lasso, ElasticNet
 from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
 
 try:
@@ -34,9 +43,13 @@ except Exception:
     causalml_qini_score = None  # type: ignore[misc, assignment]
     causalml_get_qini = None  # type: ignore[misc, assignment]
 try:
-    from lightgbm import LGBMRegressor
+    # LGBM: early stopping via callbacks (lgb.early_stopping, lgb.log_evaluation)
+    import lightgbm as lgb
     from xgboost import XGBRegressor
+
+    LGBMRegressor = lgb.LGBMRegressor
 except Exception:
+    lgb = None  # type: ignore[misc, assignment]
     LGBMRegressor = XGBRegressor = None  # type: ignore[misc, assignment]
 
 try:
@@ -68,6 +81,53 @@ DOW_NAMES: dict[int, str] = {
     5: "Sat",
     6: "Sun",
 }
+
+# Default 8 features used for modeling; recency columns use fixed bins 0 | 1-7 | >7.
+MEMBER_AGG_FEATURE_COLS = [
+    "days_since_signup",
+    "n_sessions",
+    "days_since_last_session",
+    "wellco_web_visits_count",
+    "days_since_last_wellco_web",
+    "n_claims",
+    "has_focus_icd",
+    "days_since_last_claim",
+]
+RECENCY_BIN_EDGES = (-0.1, 0.0, 7.0, np.inf)  # bins: 0 | 1-7 | >7
+RECENCY_BIN_LABELS = ("0", "1-7", ">7")
+# Descriptive suffixes for one-hot recency columns: 0 -> today, 1-7 -> last_week, >7 -> older.
+RECENCY_BIN_SUFFIXES = ("_today", "_last_week", "_older")
+# Base name per recency column so each variable's 3 binaries are clearly named (e.g. wellco_web_today).
+RECENCY_COL_BASES = {
+    "days_since_last_session": "session",
+    "days_since_last_wellco_web": "wellco_web",
+    "days_since_last_claim": "claim",
+}
+RECENCY_COLS = (
+    "days_since_last_session",
+    "days_since_last_wellco_web",
+    "days_since_last_claim",
+)
+
+# Base-key groups: used to branch on model family throughout the pipeline
+# (e.g. skip early stopping, choose SHAP explainer, etc.)
+TREE_BASE_KEYS = {"LGBM", "XGB"}
+LINEAR_BASE_KEYS = {"Ridge", "Lasso", "ElasticNet"}
+
+# Default colors for Qini curve plots (same order as typical use: models then Random).
+# Matplotlib default cycle first 4 + gray for baseline.
+QINI_CURVE_COLORS = [
+    "#1f77b4",
+    "#ff7f0e",
+    "#2ca02c",
+    "#d62728",
+    "#9467bd",
+    "#8c564b",
+    "#e377c2",
+    "#7f7f7f",
+    "#bcbd22",
+    "#17becf",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -277,147 +337,6 @@ def missingness_and_member_coverage(
                 plt.show()
 
 
-def missingness_mechanism_analysis(
-    churn_labels: pd.DataFrame,
-    web_visits: pd.DataFrame,
-    app_usage: pd.DataFrame,
-    claims: pd.DataFrame,
-    show_plot: bool = True,
-) -> None:
-    """Assess whether absence from activity sources correlates with churn/outreach (MCAR vs MAR/MNAR).
-
-    Builds has_web / has_app / has_claims on the train base, runs Chi-square tests for
-    churn and outreach by presence/absence per source, prints cross-source contingency,
-    and optionally shows a grouped bar chart of churn rate (has activity vs no activity per source).
-
-    Parameters
-    ----------
-    churn_labels : pandas.DataFrame
-        Train labels with columns member_id, churn, outreach.
-    web_visits : pandas.DataFrame
-        Train web events (member_id).
-    app_usage : pandas.DataFrame
-        Train app events (member_id).
-    claims : pandas.DataFrame
-        Train claims (member_id).
-    show_plot : bool, optional
-        If True, show grouped bar chart of churn rate by source and presence (default True).
-
-    Returns
-    -------
-    None
-    """
-    # Build has_X flags on train base
-    train_ids = churn_labels[["member_id", "churn", "outreach"]].copy()
-    web_ids = set(web_visits["member_id"].unique())
-    app_ids = set(app_usage["member_id"].unique())
-    claims_ids = set(claims["member_id"].unique())
-    train_ids["has_web"] = train_ids["member_id"].isin(web_ids).astype(int)
-    train_ids["has_app"] = train_ids["member_id"].isin(app_ids).astype(int)
-    train_ids["has_claims"] = train_ids["member_id"].isin(claims_ids).astype(int)
-
-    # Chi-square tests: churn and outreach rate by presence/absence per source
-    results: list[dict] = []
-    for source in ["has_web", "has_app", "has_claims"]:
-        for target in ["churn", "outreach"]:
-            ct = pd.crosstab(train_ids[source], train_ids[target])
-            chi2, p, dof, expected = chi2_contingency(ct)
-            rate_absent = train_ids.loc[train_ids[source] == 0, target].mean()
-            rate_present = train_ids.loc[train_ids[source] == 1, target].mean()
-            results.append(
-                {
-                    "source_flag": source,
-                    "target": target,
-                    "rate_absent (0)": round(rate_absent, 4)
-                    if pd.notna(rate_absent)
-                    else "N/A",
-                    "rate_present (1)": round(rate_present, 4),
-                    "chi2": round(chi2, 2),
-                    "p_value": f"{p:.4g}",
-                }
-            )
-
-    results_df = pd.DataFrame(results)
-    print("=" * 70)
-    print("  Chi-square tests: churn/outreach rate by presence/absence")
-    print("=" * 70)
-    print(results_df.to_string(index=False))
-
-    # Cross-source contingency (train)
-    print("\n" + "=" * 70)
-    print("  Cross-source contingency (train)")
-    print("=" * 70)
-    cross = (
-        train_ids.groupby(["has_web", "has_app", "has_claims"])
-        .size()
-        .reset_index(name="count")
-    )
-    print(cross.to_string(index=False))
-
-    # Grouped bar chart: churn rate present vs absent per source
-    if not show_plot:
-        return
-
-    chart_data: list[dict] = []
-    for source in ["has_web", "has_app", "has_claims"]:
-        for val, label in [(1, "present"), (0, "absent")]:
-            subset = train_ids[train_ids[source] == val]
-            if len(subset) > 0:
-                chart_data.append(
-                    {
-                        "source": source.replace("has_", ""),
-                        "group": label,
-                        "churn_rate": subset["churn"].mean(),
-                        "n": len(subset),
-                    }
-                )
-
-    chart_df = pd.DataFrame(chart_data)
-    if len(chart_df) == 0:
-        return
-
-    fig, ax = plt.subplots(figsize=(8, 5))
-    sources = chart_df["source"].unique()
-    x = np.arange(len(sources))
-    width = 0.35
-    present = chart_df[chart_df["group"] == "present"].set_index("source")
-    absent = chart_df[chart_df["group"] == "absent"].set_index("source")
-    bars1 = ax.bar(
-        x - width / 2,
-        [present.loc[s, "churn_rate"] if s in present.index else 0 for s in sources],
-        width,
-        label="Has activity",
-        color=sns.color_palette()[0],
-    )
-    bars2 = ax.bar(
-        x + width / 2,
-        [absent.loc[s, "churn_rate"] if s in absent.index else 0 for s in sources],
-        width,
-        label="No activity",
-        color=sns.color_palette()[3],
-    )
-    ax.set_ylabel("Churn rate")
-    ax.set_xlabel("Activity source")
-    ax.set_title("Churn rate: members with vs without activity per source")
-    ax.set_xticks(x)
-    ax.set_xticklabels(sources)
-    ax.legend()
-    for bars in [bars1, bars2]:
-        for bar in bars:
-            h = bar.get_height()
-            if h > 0:
-                ax.annotate(
-                    f"{h:.3f}",
-                    xy=(bar.get_x() + bar.get_width() / 2, h),
-                    ha="center",
-                    va="bottom",
-                    fontsize=9,
-                )
-    set_axes_clear(ax, x_axis_at_zero=False)
-    plt.tight_layout()
-    plt.show()
-
-
 def _chi2_pvalue_safe(crosstab: pd.DataFrame) -> float | None:
     """Run chi-square test on a 2x2 (or larger) crosstab; return p-value or None if invalid.
 
@@ -475,17 +394,21 @@ def missingness_mechanism_aggregated_table(
     for col in member_agg.columns:
         null_count = member_agg[col].isna().sum()
         if null_count == 0:
-            results.append({
-                "column": col,
-                "null_count": 0,
-                "churn_p": "—",
-                "outreach_p": "—",
-                "mechanism": "no nulls",
-            })
+            results.append(
+                {
+                    "column": col,
+                    "null_count": 0,
+                    "churn_p": "—",
+                    "outreach_p": "—",
+                    "mechanism": "no nulls",
+                }
+            )
             continue
         is_null = agg_with_labels[col].isna().astype(int)
         p_churn = _chi2_pvalue_safe(pd.crosstab(is_null, agg_with_labels["churn"]))
-        p_outreach = _chi2_pvalue_safe(pd.crosstab(is_null, agg_with_labels["outreach"]))
+        p_outreach = _chi2_pvalue_safe(
+            pd.crosstab(is_null, agg_with_labels["outreach"])
+        )
         sig_churn = p_churn is not None and p_churn < alpha
         sig_outreach = p_outreach is not None and p_outreach < alpha
         if sig_churn and sig_outreach:
@@ -496,20 +419,30 @@ def missingness_mechanism_aggregated_table(
             mechanism = "MAR (outreach)"
         else:
             mechanism = "MCAR (no sig. association)"
-        results.append({
-            "column": col,
-            "null_count": int(null_count),
-            "churn_p": round(p_churn, 4) if p_churn is not None else "—",
-            "outreach_p": round(p_outreach, 4) if p_outreach is not None else "—",
-            "mechanism": mechanism,
-        })
-    res_df = pd.DataFrame(results).sort_values("null_count", ascending=False).reset_index(drop=True)
+        results.append(
+            {
+                "column": col,
+                "null_count": int(null_count),
+                "churn_p": round(p_churn, 4) if p_churn is not None else "—",
+                "outreach_p": round(p_outreach, 4) if p_outreach is not None else "—",
+                "mechanism": mechanism,
+            }
+        )
+    res_df = (
+        pd.DataFrame(results)
+        .sort_values("null_count", ascending=False)
+        .reset_index(drop=True)
+    )
     if print_result:
         print("=" * 80)
-        print("  Per-member table: missingness mechanism by column (null vs churn / outreach)")
+        print(
+            "  Per-member table: missingness mechanism by column (null vs churn / outreach)"
+        )
         print("=" * 80)
         print(res_df.to_string(index=False))
-        print("\nInterpretation: MAR = missingness associated with observed variable; MCAR = no significant association.")
+        print(
+            "\nInterpretation: MAR = missingness associated with observed variable; MCAR = no significant association."
+        )
     return res_df
 
 
@@ -563,149 +496,10 @@ def plot_balance(
     plt.show()
 
 
-def feat_distribution_summary(
-    data: pd.DataFrame,
-    feat: str,
-    bins: int = 50,
-    color: str | None = None,
-) -> None:
-    """Print quantile summary and show a log-scaled histogram for one numeric feature.
-
-    Reusable for distribution sanity checks: engagement (web_visits_count, app_sessions_count,
-    url_nunique), claims (claims_count, icd_nunique), or any other zero-filled count-like column.
-    Plots log(1 + values) to handle skew.
-
-    Parameters
-    ----------
-    data : pandas.DataFrame
-        DataFrame with at least the column named by feat (zero-filled or numeric).
-    feat : str
-        Column name to summarize and plot.
-    bins : int, optional
-        Number of histogram bins (default 50).
-    color : str or None, optional
-        Bar color for the histogram. If None, default matplotlib color is used.
-
-    Returns
-    -------
-    None
-    """
-    print(f"\n{feat}:")
-    print(data[feat].quantile([0, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99, 1]).to_string())
-    fig, ax = plt.subplots(figsize=(5, 4))
-    kwargs: dict = {"bins": bins, "edgecolor": "black", "alpha": 0.7}
-    if color is not None:
-        kwargs["color"] = color
-    ax.hist(np.log1p(data[feat]), **kwargs)
-    ax.set_xlabel(f"log(1 + {feat})", fontsize=11)
-    ax.set_ylabel("Number of members", fontsize=11)
-    ax.set_title(feat, fontsize=12, fontweight="bold")
-    ax.grid(alpha=0.3)
-    set_axes_clear(ax, x_axis_at_zero=False)
-    plt.tight_layout()
-    plt.show()
-
-
-def feature_diagnostics(
-    df: pd.DataFrame,
-    feature_cols: list[str],
-    title_suffix: str = "",
-) -> None:
-    """Print feature summary statistics and zeros/missing percentages for selected columns.
-
-    Parameters
-    ----------
-    df : pandas.DataFrame
-        DataFrame containing the feature columns (e.g. train_features).
-    feature_cols : list of str
-        Column names to summarize.
-    title_suffix : str, optional
-        Suffix for section headers (e.g. '(train)').
-
-    Returns
-    -------
-    None
-    """
-    subset = df[feature_cols]
-    print("=" * 70)
-    print(f"FEATURE SUMMARY STATISTICS {title_suffix}".strip())
-    print("=" * 70)
-    print(subset.describe().T.to_string())
-    print("\n" + "=" * 70)
-    print(f"ZEROS AND MISSING VALUES {title_suffix}".strip())
-    print("=" * 70)
-    n = len(df)
-    for col in feature_cols:
-        pct_zero = (df[col] == 0).sum() / n * 100
-        pct_miss = df[col].isna().sum() / n * 100
-        print(f"  {col:<35s}  zeros: {pct_zero:6.2f}%   missing: {pct_miss:6.2f}%")
-
-
-def plot_feature_histograms(
-    df: pd.DataFrame,
-    feature_cols: list[str],
-    xlabels: dict[str, str] | None = None,
-    figsize: tuple[int, int] = (18, 8),
-    bins: int = 40,
-    ncols: int = 4,
-    suptitle: str | None = None,
-) -> None:
-    """Plot a grid of histograms (one per feature) with median line and optional custom x-labels.
-
-    Each subplot: x = feature value, y = count of members; red dashed vertical line at median.
-    Unused subplots (when len(feature_cols) < nrows * ncols) are hidden.
-
-    Parameters
-    ----------
-    df : pandas.DataFrame
-        DataFrame containing the feature columns (e.g. train_features).
-    feature_cols : list of str
-        Column names to plot, in order.
-    xlabels : dict of str -> str or None, optional
-        Map feature column name -> x-axis label. If None, column name is used.
-    figsize : tuple of (int, int), optional
-        Figure size (default (18, 8)).
-    bins : int, optional
-        Number of histogram bins per subplot (default 40).
-    ncols : int, optional
-        Number of columns in the grid (default 4).
-    suptitle : str or None, optional
-        Figure suptitle. If None, no suptitle.
-
-    Returns
-    -------
-    None
-    """
-    if xlabels is None:
-        xlabels = {}
-    n = len(feature_cols)
-    nrows = (n + ncols - 1) // ncols
-    fig, axes = plt.subplots(nrows, ncols, figsize=figsize)
-    axes = np.atleast_1d(axes).flatten()
-    for i, col in enumerate(feature_cols):
-        ax = axes[i]
-        data = df[col].dropna()
-        ax.hist(data, bins=bins, edgecolor="white", alpha=0.8)
-        ax.set_title(col, fontsize=10, fontweight="bold")
-        ax.set_xlabel(xlabels.get(col, col), fontsize=10)
-        ax.set_ylabel("Number of members", fontsize=10)
-        med = data.median()
-        ax.axvline(
-            med, color="red", linestyle="--", linewidth=1, label=f"median={med:.1f}"
-        )
-        ax.legend(fontsize=7)
-        set_axes_clear(ax, x_axis_at_zero=False)
-    for j in range(n, len(axes)):
-        axes[j].set_visible(False)
-    if suptitle:
-        plt.suptitle(suptitle, fontsize=14, fontweight="bold", y=1.02)
-    plt.tight_layout()
-    plt.show()
-
-
 # ---------------------------------------------------------------------------
 # Bivariate / variable distribution EDA (KDE for numeric, bar for categorical)
 # ---------------------------------------------------------------------------
+
 
 def _is_numeric_series(s: pd.Series) -> bool:
     """True if series is numeric or datetime (datetime plotted as KDE of ordinal)."""
@@ -718,7 +512,14 @@ def _plot_numeric_kde(series: pd.Series, ax, title: str) -> None:
     if pd.api.types.is_datetime64_any_dtype(series):
         data = data.astype("int64")
     if data.empty or data.nunique() < 2:
-        ax.text(0.5, 0.5, "Insufficient variation", ha="center", va="center", transform=ax.transAxes)
+        ax.text(
+            0.5,
+            0.5,
+            "Insufficient variation",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+        )
         ax.set_title(title)
         return
     sns.kdeplot(data=data, ax=ax, fill=True)
@@ -808,13 +609,18 @@ def plot_variable_distributions(
         if not cols:
             continue
         title_prefix = "" if omit_table_name_in_titles else f"{table_name}: "
-        suptitle = "Variable distributions" if omit_table_name_in_titles else f"Variable distributions — {table_name}"
+        suptitle = (
+            "Variable distributions"
+            if omit_table_name_in_titles
+            else f"Variable distributions — {table_name}"
+        )
         numeric_cols = [c for c in cols if _is_numeric_series(df[c])]
         cat_cols = [c for c in cols if c not in numeric_cols]
         n_plots = len(numeric_cols) + len(cat_cols)
         nrows = (n_plots + ncols - 1) // ncols
         fig, axes = plt.subplots(
-            nrows, ncols,
+            nrows,
+            ncols,
             figsize=(ncols * figsize_per_plot[0], nrows * figsize_per_plot[1]),
             constrained_layout=True,
         )
@@ -825,7 +631,9 @@ def plot_variable_distributions(
             idx += 1
         for col in cat_cols:
             _plot_categorical_bars(
-                df[col], axes[idx], f"{title_prefix}{col}",
+                df[col],
+                axes[idx],
+                f"{title_prefix}{col}",
                 max_labels=max_cat_labels,
                 high_card_threshold=high_cardinality_threshold,
             )
@@ -871,7 +679,9 @@ def plot_correlation_diagnostics(
     cols_nonconst = [c for c in feature_cols if variances[c] > 0]
     excluded = [c for c in feature_cols if c not in cols_nonconst]
     if excluded:
-        print(f"Excluding constant columns (zero variance in complete-case subset): {excluded}")
+        print(
+            f"Excluding constant columns (zero variance in complete-case subset): {excluded}"
+        )
     feature_cols_use = cols_nonconst if cols_nonconst else feature_cols
     corr = df_clean[feature_cols_use].corr()
     # For display only: treat near-zero correlations as 0 so we show "0.00" instead of "-0.00" / "0.00" (zero is zero).
@@ -914,12 +724,16 @@ def plot_correlation_diagnostics(
             r = corr.iloc[i, j]
             if abs(r) >= threshold:
                 flagged.append((feature_cols_use[i], feature_cols_use[j], r))
-                print(f"  {feature_cols_use[i]}  ↔  {feature_cols_use[j]}  :  r = {r:.3f}")
+                print(
+                    f"  {feature_cols_use[i]}  ↔  {feature_cols_use[j]}  :  r = {r:.3f}"
+                )
     if not flagged:
         print("  (none)")
 
 
-def _churn_rate_by_decile(series: pd.Series, churn: pd.Series, n_deciles: int = 10) -> pd.Series:
+def _churn_rate_by_decile(
+    series: pd.Series, churn: pd.Series, n_deciles: int = 10
+) -> pd.Series:
     """Compute mean churn (outcome) per decile of a feature. Drops NaN in series; uses qcut with duplicates='drop'.
 
     Parameters
@@ -942,7 +756,9 @@ def _churn_rate_by_decile(series: pd.Series, churn: pd.Series, n_deciles: int = 
     try:
         use["_bin"] = pd.qcut(use["x"], q=n_deciles, duplicates="drop")
     except Exception:
-        use["_bin"] = pd.qcut(use["x"].rank(method="first"), q=n_deciles, duplicates="drop")
+        use["_bin"] = pd.qcut(
+            use["x"].rank(method="first"), q=n_deciles, duplicates="drop"
+        )
     return use.groupby("_bin", observed=True)["y"].mean()
 
 
@@ -1070,7 +886,13 @@ def plot_bivariate_churn_grid(
             else:
                 labels = [str(i) for i in rate_by_level.index]
                 x_pos = range(len(rate_by_level))
-                ax_dec.bar(x_pos, rate_by_level.values, color="steelblue", edgecolor="black", alpha=0.85)
+                ax_dec.bar(
+                    x_pos,
+                    rate_by_level.values,
+                    color="steelblue",
+                    edgecolor="black",
+                    alpha=0.85,
+                )
                 ax_dec.set_xticks(x_pos)
                 ax_dec.set_xticklabels(labels, fontsize=11)
                 y_lo, y_hi = _rate_axis_limits(rate_by_level.values)
@@ -1078,15 +900,23 @@ def plot_bivariate_churn_grid(
                 ax_dec.set_ylabel("Churn rate", fontsize=10)
                 ax_dec.set_title(f"{col}: churn rate by level (binary)", fontsize=11)
         else:
-            rate_by_dec = _churn_rate_by_decile(use[col], use[target_col], n_deciles=n_deciles)
+            rate_by_dec = _churn_rate_by_decile(
+                use[col], use[target_col], n_deciles=n_deciles
+            )
             if rate_by_dec.empty:
                 ax_dec.set_title(f"{col} (no bins)")
             else:
                 n_bars = len(rate_by_dec)
                 x_pos = range(n_bars)
-                ax_dec.bar(x_pos, rate_by_dec.values, color="steelblue", edgecolor="black", alpha=0.85)
+                ax_dec.bar(
+                    x_pos,
+                    rate_by_dec.values,
+                    color="steelblue",
+                    edgecolor="black",
+                    alpha=0.85,
+                )
                 ax_dec.set_xticks(x_pos)
-                ax_dec.set_xticklabels([f"D{i+1}" for i in range(n_bars)], fontsize=9)
+                ax_dec.set_xticklabels([f"D{i + 1}" for i in range(n_bars)], fontsize=9)
                 y_lo, y_hi = _rate_axis_limits(rate_by_dec.values)
                 ax_dec.set_ylim(y_lo, y_hi)
                 ax_dec.set_ylabel("Churn rate", fontsize=10)
@@ -1097,98 +927,23 @@ def plot_bivariate_churn_grid(
             use_box = use.copy()
             use_box[target_col] = use_box[target_col].astype(str)
             sns.boxplot(
-                data=use_box, x=target_col, y=col, hue=target_col, legend=False, ax=ax_box,
+                data=use_box,
+                x=target_col,
+                y=col,
+                hue=target_col,
+                legend=False,
+                ax=ax_box,
                 palette=palette,
             )
             ax_box.set_title(f"{col}: distribution by churn", fontsize=11)
             ax_box.set_xlabel(target_col, fontsize=10)
             ax_box.set_ylabel(col, fontsize=10)
-            fig.subplots_adjust(left=0.08, right=0.95, top=0.88, bottom=0.12, wspace=0.28)
+            fig.subplots_adjust(
+                left=0.08, right=0.95, top=0.88, bottom=0.12, wspace=0.28
+            )
         else:
             fig.subplots_adjust(left=0.12, right=0.95, top=0.88, bottom=0.12)
         plt.show()
-
-
-def build_claims_labels(
-    claims: pd.DataFrame,
-    churn_labels: pd.DataFrame,
-    focus_icd_codes: list[str] | None = None,
-) -> pd.DataFrame:
-    """Build claims-and-labels dataframe: member_id, churn, outreach, claims_count, icd_nunique, has_focus_icd, focus_icd_count.
-
-    Aggregates claims by member (count, unique ICDs, focus-ICD flag and count), merges with
-    churn_labels, and zero-fills missing values. Used for claims distribution sanity checks
-    and uplift-by-claims-strata analyses.
-
-    Parameters
-    ----------
-    claims : pandas.DataFrame
-        Claims table with member_id and icd_code.
-    churn_labels : pandas.DataFrame
-        Labels with member_id, churn, outreach.
-    focus_icd_codes : list of str or None, optional
-        ICD codes to treat as focus (e.g. WellCo clinical focus). If None, uses FOCUS_ICD_CODES.
-
-    Returns
-    -------
-    pandas.DataFrame
-        One row per member: member_id, churn, outreach, claims_count, icd_nunique, has_focus_icd, focus_icd_count (all filled, no NaN).
-    """
-    if focus_icd_codes is None:
-        focus_icd_codes = FOCUS_ICD_CODES
-    claims_per = claims.groupby("member_id").size().rename("claims_count").reset_index()
-    icd_nun = (
-        claims.groupby("member_id")["icd_code"]
-        .nunique()
-        .rename("icd_nunique")
-        .reset_index()
-    )
-    claims_f = claims.copy()
-    claims_f["is_focus"] = claims_f["icd_code"].isin(focus_icd_codes)
-    focus_any = (
-        claims_f.groupby("member_id")["is_focus"]
-        .any()
-        .rename("has_focus_icd")
-        .reset_index()
-    )
-    focus_count = (
-        claims_f[claims_f["is_focus"]]
-        .groupby("member_id")["icd_code"]
-        .nunique()
-        .rename("focus_icd_count")
-        .reset_index()
-    )
-    cl = (
-        churn_labels[["member_id", "churn", "outreach"]]
-        .merge(claims_per, on="member_id", how="left")
-        .merge(icd_nun, on="member_id", how="left")
-        .merge(focus_any, on="member_id", how="left")
-        .merge(focus_count, on="member_id", how="left")
-    )
-    cl["claims_count"] = cl["claims_count"].fillna(0)
-    cl["icd_nunique"] = cl["icd_nunique"].fillna(0)
-    cl["has_focus_icd"] = cl["has_focus_icd"].fillna(False).astype(int)
-    cl["focus_icd_count"] = cl["focus_icd_count"].fillna(0).astype(int)
-    return cl
-
-
-def print_focus_icd_stats(cl: pd.DataFrame) -> None:
-    """Print focus-ICD prevalence and focus_icd_count distribution for a claims-labels dataframe.
-
-    Assumes cl was produced by build_claims_labels (columns has_focus_icd, focus_icd_count).
-
-    Parameters
-    ----------
-    cl : pandas.DataFrame
-        Claims-labels dataframe from build_claims_labels.
-
-    Returns
-    -------
-    None
-    """
-    print(f"\nFocus-ICD prevalence: {cl['has_focus_icd'].mean():.3f}")
-    print("\nFocus-ICD count distribution:")
-    print(cl["focus_icd_count"].value_counts().sort_index().to_string())
 
 
 def count_events_before_signup(
@@ -1216,210 +971,6 @@ def count_events_before_signup(
         labels_df[["member_id", "signup_date"]], on="member_id", how="left"
     )
     return (merged[date_col] < merged["signup_date"]).sum()
-
-
-def time_bin(h: int) -> str:
-    """Map hour (0-23) to a time-of-day label for aggregation.
-
-    Parameters
-    ----------
-    h : int
-        Hour of day (0-23).
-
-    Returns
-    -------
-    str
-        One of 'Early Morning', 'Morning', 'Afternoon', 'Evening'.
-    """
-    if h < 6:
-        return "Early Morning"
-    if h < 12:
-        return "Morning"
-    if h < 18:
-        return "Afternoon"
-    return "Evening"
-
-
-def compute_uplift(
-    labels_df: pd.DataFrame, member_ids: pd.Series | np.ndarray
-) -> tuple[float, int, int]:
-    """Return (uplift, n_treated, n_control) for a set of member IDs.
-
-    Parameters
-    ----------
-    labels_df : pandas.DataFrame
-        Must contain columns member_id, churn, outreach.
-    member_ids : array-like
-        Member IDs to compute uplift for.
-
-    Returns
-    -------
-    tuple of (float, int, int)
-        uplift, n_treated, n_control. uplift is np.nan if no treated or control.
-    """
-    df = labels_df[labels_df["member_id"].isin(member_ids)]
-    tr = df[df["outreach"] == 1]["churn"]
-    co = df[df["outreach"] == 0]["churn"]
-    uplift = tr.mean() - co.mean() if len(tr) > 0 and len(co) > 0 else np.nan
-    return float(uplift) if not np.isnan(uplift) else np.nan, len(tr), len(co)
-
-
-def plot_uplift_bars(
-    bin_names: list[str],
-    uplifts: list[float],
-    title: str,
-    xlabel: str,
-) -> None:
-    """Simple bar plot: one bar per bin, y = uplift, horizontal zero line.
-
-    Parameters
-    ----------
-    bin_names : list of str
-        Labels for each bar.
-    uplifts : list of float
-        Uplift value per bin.
-    title : str
-        Plot title.
-    xlabel : str
-        X-axis label.
-
-    Returns
-    -------
-    None
-    """
-    fig, ax = plt.subplots(figsize=(8, 4))
-    ax.bar(
-        range(len(bin_names)), uplifts, color="steelblue", edgecolor="black", alpha=0.85
-    )
-    # Prominent horizontal line at y=0 (x-axis) so negative uplift is clearly below it
-    ax.axhline(0, color="black", linestyle="-", linewidth=1.5)
-    ax.set_xticks(range(len(bin_names)))
-    ax.set_xticklabels(bin_names, rotation=20, ha="right")
-    ax.set_xlabel(xlabel, fontsize=12)
-    ax.set_ylabel("Uplift (churn-rate difference)", fontsize=12)
-    ax.set_title(title, fontsize=14, fontweight="bold")
-    ax.grid(axis="y", alpha=0.3)
-    ax.tick_params(axis="both", which="major", length=5, width=1, labelsize=10)
-    set_axes_clear(ax, x_axis_at_zero=True)
-    plt.tight_layout()
-    plt.show()
-
-
-def uplift_by_groups(
-    events: pd.DataFrame,
-    labels_df: pd.DataFrame,
-    group_col: str,
-    group_values: list,
-    plot_labels: list[str] | None = None,
-    title: str = "",
-    xlabel: str = "",
-) -> None:
-    """Compute uplift per group, plot bars, and print a summary table.
-
-    For each value in group_values, filters events by group_col == value, gets member IDs,
-    computes uplift via compute_uplift(labels_df, ids), then plots all uplifts and prints
-    a table (Group, Uplift, n_treated, n_control). Use for time-of-day, day-of-week,
-    weekend vs weekday, or any other categorical split.
-
-    Parameters
-    ----------
-    events : pandas.DataFrame
-        Event table with member_id and the column named by group_col.
-    labels_df : pandas.DataFrame
-        Labels with member_id, churn, outreach (e.g. churn_labels or subset).
-    group_col : str
-        Column in events to filter on (e.g. 'time_of_day', 'dow_name', 'is_weekend').
-    group_values : list
-        Ordered list of values to iterate over (e.g. tod_order, dow_order, [False, True]).
-    plot_labels : list of str or None, optional
-        Labels for plot and table. If None, use str(v) for each value in group_values.
-    title : str, optional
-        Plot title.
-    xlabel : str, optional
-        X-axis label.
-
-    Returns
-    -------
-    None
-    """
-    display_labels = (
-        plot_labels if plot_labels is not None else [str(v) for v in group_values]
-    )
-    uplifts: list[float] = []
-    n_ts: list[int] = []
-    n_cs: list[int] = []
-    for val in group_values:
-        ids = events.loc[events[group_col] == val, "member_id"].unique()
-        u, nt, nc = compute_uplift(labels_df, ids)
-        uplifts.append(u)
-        n_ts.append(nt)
-        n_cs.append(nc)
-    plot_uplift_bars(display_labels, uplifts, title=title, xlabel=xlabel)
-    print(f"{'Group':<25} {'Uplift':>8} {'n_treated':>10} {'n_control':>10}")
-    for name, u, nt, nc in zip(display_labels, uplifts, n_ts, n_cs):
-        print(f"{name:<25} {u:>8.4f} {nt:>10} {nc:>10}")
-
-
-def build_recency_tenure(
-    members_df: pd.DataFrame,
-    web_df: pd.DataFrame,
-    app_df: pd.DataFrame,
-    claims_df: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.Timestamp]:
-    """Build member-level recency and tenure features.
-
-    Parameters
-    ----------
-    members_df : DataFrame with at least member_id and signup_date.
-    web_df : DataFrame with member_id and timestamp.
-    app_df : DataFrame with member_id and timestamp.
-    claims_df : DataFrame with member_id and diagnosis_date.
-
-    Returns
-    -------
-    tuple of (DataFrame, pd.Timestamp)
-        DataFrame indexed by member_id with columns:
-        days_since_last_web, days_since_last_app, days_since_last_claim,
-        days_since_last_activity, tenure_days, recent_any_7d.
-        Second element is the reference date used.
-    """
-    ref_date = max(
-        pd.to_datetime(web_df["timestamp"], errors="coerce").dropna().max(),
-        pd.to_datetime(app_df["timestamp"], errors="coerce").dropna().max(),
-        pd.to_datetime(claims_df["diagnosis_date"], errors="coerce").dropna().max(),
-    )
-    last_web = web_df.groupby("member_id")["timestamp"].max()
-    last_app = app_df.groupby("member_id")["timestamp"].max()
-    last_claim = claims_df.groupby("member_id")["diagnosis_date"].max()
-
-    out = members_df[["member_id", "signup_date"]].copy()
-    out["days_since_last_web"] = (
-        out["member_id"].map(last_web).pipe(lambda s: (ref_date - s).dt.days)
-    )
-    out["days_since_last_app"] = (
-        out["member_id"].map(last_app).pipe(lambda s: (ref_date - s).dt.days)
-    )
-    out["days_since_last_claim"] = (
-        out["member_id"].map(last_claim).pipe(lambda s: (ref_date - s).dt.days)
-    )
-    last_any = (
-        pd.concat(
-            [last_web.rename("ts"), last_app.rename("ts"), last_claim.rename("ts")]
-        )
-        .groupby(level=0)
-        .max()
-    )
-    out["days_since_last_activity"] = (
-        out["member_id"].map(last_any).pipe(lambda s: (ref_date - s).dt.days)
-    )
-    out["tenure_days"] = (
-        ref_date - pd.to_datetime(out["signup_date"], errors="coerce")
-    ).dt.days
-    out["recent_any_7d"] = (
-        out["days_since_last_activity"].notna() & (out["days_since_last_activity"] <= 7)
-    ).astype(int)
-    out = out.set_index("member_id").drop(columns=["signup_date"])
-    return out, ref_date
 
 
 def build_member_aggregates(
@@ -1495,9 +1046,9 @@ def build_member_aggregates(
     # No row in app_df means count = 0, not missing (unlike days_since_*, which is truly unknown).
     members["n_sessions"] = members["n_sessions"].fillna(0).astype(int)
     members["has_app_usage"] = members["n_sessions"].gt(0).astype(int)
-    members["days_since_last_session"] = (
-        ref_date - members["last_app"]
-    ).dt.days.where(members["last_app"].notna())
+    members["days_since_last_session"] = (ref_date - members["last_app"]).dt.days.where(
+        members["last_app"].notna()
+    )
     members = members.drop(columns=["last_app"])
 
     # Web (all visits): count, has_any, last timestamp, n_distinct_titles
@@ -1511,14 +1062,16 @@ def build_member_aggregates(
     # No row in web_df means count = 0, not missing.
     members["n_web_visits"] = members["n_web_visits"].fillna(0).astype(int)
     members["has_web_visits"] = members["n_web_visits"].gt(0).astype(int)
-    members["days_since_last_visit"] = (
-        ref_date - members["last_web"]
-    ).dt.days.where(members["last_web"].notna())
+    members["days_since_last_visit"] = (ref_date - members["last_web"]).dt.days.where(
+        members["last_web"].notna()
+    )
     members = members.drop(columns=["last_web"])
     if "n_distinct_titles" not in members.columns:
         members["n_distinct_titles"] = 0
     else:
-        members["n_distinct_titles"] = members["n_distinct_titles"].fillna(0).astype(int)
+        members["n_distinct_titles"] = (
+            members["n_distinct_titles"].fillna(0).astype(int)
+        )
 
     # WellCo-relevant web: embed + filter, then wellco_web_visits_count, days_since_last_wellco_web
     if wellco_embedding is not None and embed_model is not None:
@@ -1561,30 +1114,38 @@ def build_member_aggregates(
         last_claim=("diagnosis_date", "max"),
     )
     if "icd_code" in claims_df.columns:
-        claims_agg["icd_distinct_count"] = claims_df.groupby("member_id")["icd_code"].nunique()
+        claims_agg["icd_distinct_count"] = claims_df.groupby("member_id")[
+            "icd_code"
+        ].nunique()
         focus = claims_df[claims_df["icd_code"].isin(focus_icd_codes)]
         focus_agg = focus.groupby("member_id").size().rename("n_focus_icd_claims")
         claims_agg = claims_agg.join(focus_agg, how="left")
-        claims_agg["n_focus_icd_claims"] = claims_agg["n_focus_icd_claims"].fillna(0).astype(int)
+        claims_agg["n_focus_icd_claims"] = (
+            claims_agg["n_focus_icd_claims"].fillna(0).astype(int)
+        )
         claims_agg["has_focus_icd"] = claims_agg["n_focus_icd_claims"].gt(0).astype(int)
     members = members.merge(claims_agg, on="member_id", how="left")
     # No row in claims_df means count = 0, not missing.
     members["n_claims"] = members["n_claims"].fillna(0).astype(int)
     members["has_claims"] = members["n_claims"].gt(0).astype(int)
-    members["days_since_last_claim"] = (
-        ref_date - members["last_claim"]
-    ).dt.days.where(members["last_claim"].notna())
+    members["days_since_last_claim"] = (ref_date - members["last_claim"]).dt.days.where(
+        members["last_claim"].notna()
+    )
     members = members.drop(columns=["last_claim"])
     if "n_focus_icd_claims" not in members.columns:
         members["n_focus_icd_claims"] = 0
         members["has_focus_icd"] = 0
     else:
-        members["n_focus_icd_claims"] = members["n_focus_icd_claims"].fillna(0).astype(int)
+        members["n_focus_icd_claims"] = (
+            members["n_focus_icd_claims"].fillna(0).astype(int)
+        )
         members["has_focus_icd"] = members["n_focus_icd_claims"].gt(0).astype(int)
     if "icd_distinct_count" not in members.columns:
         members["icd_distinct_count"] = 0
     else:
-        members["icd_distinct_count"] = members["icd_distinct_count"].fillna(0).astype(int)
+        members["icd_distinct_count"] = (
+            members["icd_distinct_count"].fillna(0).astype(int)
+        )
 
     return members
 
@@ -1615,7 +1176,6 @@ def verify_member_aggregates(
     dict
         Keys: row_count_ok, app_ok, web_ok, claims_ok, app_detail, web_detail, claims_detail, message.
     """
-    import json as _json
     base_ids = set(members_df["member_id"].unique())
     agg_ids = set(member_agg["member_id"].unique())
     row_count_ok = len(member_agg) == len(base_ids) and agg_ids == base_ids
@@ -1623,17 +1183,41 @@ def verify_member_aggregates(
     web_counts = web_df.groupby("member_id").size().rename("_cnt")
     claims_counts = claims_df.groupby("member_id").size().rename("_cnt")
     # Count columns are 0 when member absent; when present, count must match raw table.
-    ma_app = member_agg.set_index("member_id")[["n_sessions"]].join(app_counts, how="left")
-    app_match = ((ma_app["_cnt"].isna() & (ma_app["n_sessions"] == 0)) | (ma_app["n_sessions"] == ma_app["_cnt"])).all()
-    app_zero_ok = ((~member_agg["member_id"].isin(app_df["member_id"])) & (member_agg["n_sessions"] != 0)).sum() == 0
+    ma_app = member_agg.set_index("member_id")[["n_sessions"]].join(
+        app_counts, how="left"
+    )
+    app_match = (
+        (ma_app["_cnt"].isna() & (ma_app["n_sessions"] == 0))
+        | (ma_app["n_sessions"] == ma_app["_cnt"])
+    ).all()
+    app_zero_ok = (
+        (~member_agg["member_id"].isin(app_df["member_id"]))
+        & (member_agg["n_sessions"] != 0)
+    ).sum() == 0
     app_ok = bool(app_match and app_zero_ok)
-    ma_web = member_agg.set_index("member_id")[["n_web_visits"]].join(web_counts, how="left")
-    web_match = ((ma_web["_cnt"].isna() & (ma_web["n_web_visits"] == 0)) | (ma_web["n_web_visits"] == ma_web["_cnt"])).all()
-    web_zero_ok = ((~member_agg["member_id"].isin(web_df["member_id"])) & (member_agg["n_web_visits"] != 0)).sum() == 0
+    ma_web = member_agg.set_index("member_id")[["n_web_visits"]].join(
+        web_counts, how="left"
+    )
+    web_match = (
+        (ma_web["_cnt"].isna() & (ma_web["n_web_visits"] == 0))
+        | (ma_web["n_web_visits"] == ma_web["_cnt"])
+    ).all()
+    web_zero_ok = (
+        (~member_agg["member_id"].isin(web_df["member_id"]))
+        & (member_agg["n_web_visits"] != 0)
+    ).sum() == 0
     web_ok = bool(web_match and web_zero_ok)
-    ma_claims = member_agg.set_index("member_id")[["n_claims"]].join(claims_counts, how="left")
-    claims_match = ((ma_claims["_cnt"].isna() & (ma_claims["n_claims"] == 0)) | (ma_claims["n_claims"] == ma_claims["_cnt"])).all()
-    claims_zero_ok = ((~member_agg["member_id"].isin(claims_df["member_id"])) & (member_agg["n_claims"] != 0)).sum() == 0
+    ma_claims = member_agg.set_index("member_id")[["n_claims"]].join(
+        claims_counts, how="left"
+    )
+    claims_match = (
+        (ma_claims["_cnt"].isna() & (ma_claims["n_claims"] == 0))
+        | (ma_claims["n_claims"] == ma_claims["_cnt"])
+    ).all()
+    claims_zero_ok = (
+        (~member_agg["member_id"].isin(claims_df["member_id"]))
+        & (member_agg["n_claims"] != 0)
+    ).sum() == 0
     claims_ok = bool(claims_match and claims_zero_ok)
     all_ok = row_count_ok and app_ok and web_ok and claims_ok
     details = {
@@ -1656,41 +1240,24 @@ def verify_member_aggregates(
         try:
             _payload = {"all_ok": all_ok, **details}
             with open(log_path, "a", encoding="utf-8") as _f:
-                _f.write(_json.dumps(_payload, default=str) + "\n")
+                _f.write(json.dumps(_payload, default=str) + "\n")
         except Exception:
             pass
-    return {"ok": all_ok, "details": details, "message": "OK" if all_ok else "One or more checks failed"}
+    return {
+        "ok": all_ok,
+        "details": details,
+        "message": "OK" if all_ok else "One or more checks failed",
+    }
 
 
 # ---------------------------------------------------------------------------
 # Feature engineering pipeline (per-member aggregates)
 # ---------------------------------------------------------------------------
 
-# Default 8 features used for modeling; recency columns use fixed bins 0 | 1-7 | >7.
-MEMBER_AGG_FEATURE_COLS = [
-    "days_since_signup",
-    "n_sessions",
-    "days_since_last_session",
-    "wellco_web_visits_count",
-    "days_since_last_wellco_web",
-    "n_claims",
-    "has_focus_icd",
-    "days_since_last_claim",
-]
-RECENCY_BIN_EDGES = (-0.1, 0.0, 7.0, np.inf)  # bins: 0 | 1-7 | >7
-RECENCY_BIN_LABELS = ("0", "1-7", ">7")
-# Descriptive suffixes for one-hot recency columns: 0 -> today, 1-7 -> last_week, >7 -> older.
-RECENCY_BIN_SUFFIXES = ("_today", "_last_week", "_older")
-# Base name per recency column so each variable's 3 binaries are clearly named (e.g. wellco_web_today).
-RECENCY_COL_BASES = {
-    "days_since_last_session": "session",
-    "days_since_last_wellco_web": "wellco_web",
-    "days_since_last_claim": "claim",
-}
-RECENCY_COLS = ("days_since_last_session", "days_since_last_wellco_web", "days_since_last_claim")
 
-
-def _apply_minmax(agg: pd.DataFrame, cols: list[str], reference: pd.DataFrame) -> pd.DataFrame:
+def _apply_minmax(
+    agg: pd.DataFrame, cols: list[str], reference: pd.DataFrame
+) -> pd.DataFrame:
     """Apply Min-Max scaling using reference table for min/max. Returns scaled values."""
     scaler = MinMaxScaler()
     scaler.fit(reference[cols])
@@ -1755,7 +1322,9 @@ def engineer_member_aggregates(
     out = agg[["member_id"]].copy()
 
     # Min-Max: days_since_signup, n_claims
-    minmax_cols = [c for c in ["days_since_signup", "n_claims"] if c in cols and c in agg.columns]
+    minmax_cols = [
+        c for c in ["days_since_signup", "n_claims"] if c in cols and c in agg.columns
+    ]
     if minmax_cols:
         out[minmax_cols] = _apply_minmax(agg, minmax_cols, ref)
 
@@ -1772,7 +1341,9 @@ def engineer_member_aggregates(
         if col in cols and col in agg.columns:
             binned = _apply_recency_binning(agg[col])
             base = RECENCY_COL_BASES[col]
-            for label, suffix in zip(RECENCY_BIN_LABELS, RECENCY_BIN_SUFFIXES, strict=True):
+            for label, suffix in zip(
+                RECENCY_BIN_LABELS, RECENCY_BIN_SUFFIXES, strict=True
+            ):
                 out[base + suffix] = (binned == label).astype(int)
 
     # Keep as-is: has_focus_icd
@@ -2102,207 +1673,17 @@ def run_relevance_filter_sanity_check(
     print(f"  Member 12: {counts.get(12, 0)} visits (correctly excluded)")
 
 
-def agg_web_features(
-    web_relevant_df: pd.DataFrame,
-    members_df: pd.DataFrame,
-    ref_date: pd.Timestamp,
-) -> pd.DataFrame:
-    """Aggregate WellCo-relevant web visits into member-level features.
-
-    Returns
-    -------
-    pd.DataFrame
-        Columns: member_id, wellco_web_visits_count, days_since_last_wellco_web.
-    """
-    wdf = web_relevant_df[web_relevant_df["timestamp"] <= ref_date].copy()
-    if wdf.empty:
-        out = members_df[["member_id"]].copy()
-        out["wellco_web_visits_count"] = 0
-        out["days_since_last_wellco_web"] = np.nan
-        return out
-    agg = (
-        wdf.groupby("member_id")
-        .agg(
-            wellco_web_visits_count=("timestamp", "count"),
-            _last_visit=("timestamp", "max"),
-        )
-        .reset_index()
-    )
-    agg["days_since_last_wellco_web"] = (ref_date - agg["_last_visit"]).dt.days
-    agg.drop(columns="_last_visit", inplace=True)
-    out = members_df[["member_id"]].merge(agg, on="member_id", how="left")
-    out["wellco_web_visits_count"] = (
-        out["wellco_web_visits_count"].fillna(0).astype(int)
-    )
-    return out
-
-
-def agg_app_features(
-    app_df: pd.DataFrame,
-    members_df: pd.DataFrame,
-    ref_date: pd.Timestamp,
-) -> pd.DataFrame:
-    """Count app sessions per member and days since last app session up to the reference date.
-
-    Returns
-    -------
-    pd.DataFrame
-        Columns: member_id, app_sessions_count, days_since_last_app.
-    """
-    adf = app_df[app_df["timestamp"] <= ref_date].copy()
-    counts = adf.groupby("member_id").size().rename("app_sessions_count").reset_index()
-    last_app = adf.groupby("member_id")["timestamp"].max().reset_index()
-    last_app["days_since_last_app"] = (ref_date - last_app["timestamp"]).dt.days
-    last_app = last_app[["member_id", "days_since_last_app"]]
-    out = members_df[["member_id"]].merge(counts, on="member_id", how="left")
-    out = out.merge(last_app, on="member_id", how="left")
-    out["app_sessions_count"] = out["app_sessions_count"].fillna(0).astype(int)
-    return out
-
-
-def agg_claims_features(
-    claims_df: pd.DataFrame,
-    members_df: pd.DataFrame,
-    ref_date: pd.Timestamp,
-    focus_icd_codes: list[str] | None = None,
-) -> pd.DataFrame:
-    """Aggregate claims into member-level diagnostic features.
-
-    Returns
-    -------
-    pd.DataFrame
-        Columns: member_id, claims_count, icd_distinct_count, has_focus_icd, days_since_last_claim.
-    """
-    if focus_icd_codes is None:
-        focus_icd_codes = FOCUS_ICD_CODES
-    cdf = claims_df[claims_df["diagnosis_date"] <= ref_date].copy()
-    if cdf.empty:
-        out = members_df[["member_id"]].copy()
-        out["claims_count"] = 0
-        out["icd_distinct_count"] = 0
-        out["has_focus_icd"] = 0
-        out["days_since_last_claim"] = np.nan
-        return out
-    cdf["_is_focus"] = cdf["icd_code"].isin(focus_icd_codes)
-    agg = (
-        cdf.groupby("member_id")
-        .agg(
-            claims_count=("diagnosis_date", "count"),
-            icd_distinct_count=("icd_code", "nunique"),
-            has_focus_icd=("_is_focus", "any"),
-            _last_claim=("diagnosis_date", "max"),
-        )
-        .reset_index()
-    )
-    agg["has_focus_icd"] = agg["has_focus_icd"].astype(int)
-    agg["days_since_last_claim"] = (ref_date - agg["_last_claim"]).dt.days
-    agg.drop(columns="_last_claim", inplace=True)
-    out = members_df[["member_id"]].merge(agg, on="member_id", how="left")
-    out["claims_count"] = out["claims_count"].fillna(0).astype(int)
-    out["icd_distinct_count"] = out["icd_distinct_count"].fillna(0).astype(int)
-    out["has_focus_icd"] = out["has_focus_icd"].fillna(0).astype(int)
-    return out
-
-
-def agg_lifecycle_tenure(
-    members_df: pd.DataFrame, ref_date: pd.Timestamp
-) -> pd.DataFrame:
-    """Compute membership tenure in days as of the reference date.
-
-    Returns
-    -------
-    pd.DataFrame
-        Columns: member_id, tenure_days.
-    """
-    out = members_df[["member_id"]].copy()
-    out["tenure_days"] = (ref_date - members_df["signup_date"]).dt.days
-    return out
-
-
-def build_feature_matrix(
-    members_df: pd.DataFrame,
-    web_df: pd.DataFrame,
-    app_df: pd.DataFrame,
-    claims_df: pd.DataFrame,
-    ref_date: pd.Timestamp,
-    *,
-    wellco_embedding: np.ndarray,
-    embed_model: "ST",
-    similarity_threshold: float = SIMILARITY_THRESHOLD,
-    focus_icd_codes: list[str] | None = None,
-    include_labels: bool = False,
-) -> pd.DataFrame:
-    """Build the full member-level feature matrix from raw event tables.
-
-    Parameters
-    ----------
-    members_df : pd.DataFrame
-        Member roster with member_id, signup_date; optionally outreach, churn.
-    web_df, app_df, claims_df : pd.DataFrame
-        Raw event tables.
-    ref_date : pd.Timestamp
-        Decision / reference date.
-    wellco_embedding : np.ndarray
-        Pre-computed WellCo brief embedding (1, dim).
-    embed_model : SentenceTransformer
-        Pre-loaded model.
-    similarity_threshold : float
-        Cosine-similarity cutoff for web relevance.
-    focus_icd_codes : list[str] or None
-        ICD-10 focus codes (default: FOCUS_ICD_CODES).
-    include_labels : bool
-        If True and members_df has outreach/churn, append those columns.
-
-    Returns
-    -------
-    pd.DataFrame
-        One row per member; feature columns + optionally outreach, churn.
-    """
-    if focus_icd_codes is None:
-        focus_icd_codes = FOCUS_ICD_CODES
-    web_relevant = filter_wellco_relevant_visits(
-        web_df,
-        wellco_embedding=wellco_embedding,
-        embed_model=embed_model,
-        similarity_threshold=similarity_threshold,
-        ref_date=ref_date,
-    )
-    feat_web = agg_web_features(web_relevant, members_df, ref_date)
-    feat_app = agg_app_features(app_df, members_df, ref_date)
-    feat_claims = agg_claims_features(claims_df, members_df, ref_date, focus_icd_codes)
-    feat_life = agg_lifecycle_tenure(members_df, ref_date)
-    feature_matrix = (
-        members_df[["member_id"]]
-        .merge(feat_web, on="member_id", how="left")
-        .merge(feat_app, on="member_id", how="left")
-        .merge(feat_claims, on="member_id", how="left")
-        .merge(feat_life, on="member_id", how="left")
-    )
-    if include_labels:
-        label_cols = [c for c in ("outreach", "churn") if c in members_df.columns]
-        if label_cols:
-            feature_matrix = feature_matrix.merge(
-                members_df[["member_id"] + label_cols], on="member_id", how="left"
-            )
-    return feature_matrix
-
-
 # ---------------------------------------------------------------------------
 # Model and metric helpers
 # ---------------------------------------------------------------------------
 
-# Base-key groups: used to branch on model family throughout the pipeline
-# (e.g. skip early stopping, choose SHAP explainer, etc.)
-TREE_BASE_KEYS = {"LGBM", "XGB"}
-LINEAR_BASE_KEYS = {"Ridge", "Lasso", "ElasticNet"}
-
 
 def _make_linear_learner(base_key: str, base_params: dict | None = None) -> object:
-    """Create a Pipeline(SimpleImputer → StandardScaler → linear model).
+    """Create a Pipeline containing only the linear model (no imputer/scaler).
 
-    Linear models require NaN-free, standardised inputs.  The pipeline
-    handles both automatically so the rest of the code (CausalML fit/predict)
-    stays unchanged.
+    Inputs are assumed to be already NaN-free and scaled upstream (e.g. by
+    engineer_member_aggregates). Returns Pipeline([("model", model)]) so
+    CausalML fit/predict and SHAP code paths stay unchanged.
 
     Parameters
     ----------
@@ -2314,40 +1695,31 @@ def _make_linear_learner(base_key: str, base_params: dict | None = None) -> obje
     Returns
     -------
     sklearn.pipeline.Pipeline
-        Imputer → Scaler → Linear model.
+        Single-step pipeline: ("model", linear model).
     """
-    from sklearn.impute import SimpleImputer
-    from sklearn.pipeline import Pipeline
-    from sklearn.preprocessing import StandardScaler
-
     params = dict(base_params) if base_params else {}
 
     if base_key == "Ridge":
-        from sklearn.linear_model import Ridge
         # Default alpha=1.0 is fine for Ridge; no change.
         model = Ridge(**params)
     elif base_key == "Lasso":
-        from sklearn.linear_model import Lasso
         # sklearn default alpha=1.0 often zeros all coefs on weak signals → constant predictions.
         # Use a gentler default so Section 5 CV differentiates Lasso from Ridge/ElasticNet.
         params.setdefault("alpha", 0.1)
         params.setdefault("max_iter", 10000)
         model = Lasso(**params)
     elif base_key == "ElasticNet":
-        from sklearn.linear_model import ElasticNet
         params.setdefault("alpha", 0.1)
-        params.setdefault("l1_ratio", 0.5)  # explicit mix so it differs from Lasso (1.0) and Ridge (0)
+        params.setdefault(
+            "l1_ratio", 0.5
+        )  # explicit mix so it differs from Lasso (1.0) and Ridge (0)
         params.setdefault("max_iter", 10000)
         model = ElasticNet(**params)
     else:
         raise ValueError(f"Unknown linear base_key: {base_key}")
 
-    # SimpleImputer strategy="median" handles NaN; StandardScaler normalises
-    return Pipeline([
-        ("imputer", SimpleImputer(strategy="median")),
-        ("scaler", StandardScaler()),
-        ("model", model),
-    ])
+    # No imputer/scaler: inputs are already clean and scaled upstream.
+    return Pipeline([("model", model)])
 
 
 def make_lgbm():
@@ -2676,7 +2048,7 @@ def build_model(
     if BaseSRegressor is None or BaseTRegressor is None:
         raise ImportError("causalml is not installed")
 
-    # Linear base learners: Pipeline(Imputer → Scaler → Model)
+    # Linear base learners: Pipeline(model) — no imputer/scaler; data preprocessed upstream
     if base_key in LINEAR_BASE_KEYS:
         learner = _make_linear_learner(base_key, base_params)
     elif base_params is None:
@@ -2685,7 +2057,9 @@ def build_model(
         if base_key == "LGBM":
             if LGBMRegressor is None:
                 raise ImportError("lightgbm is not installed")
-            learner = LGBMRegressor(random_state=RANDOM_STATE, verbose=-1, **base_params)
+            learner = LGBMRegressor(
+                random_state=RANDOM_STATE, verbose=-1, **base_params
+            )
         elif base_key == "XGB":
             if XGBRegressor is None:
                 raise ImportError("xgboost is not installed")
@@ -2819,11 +2193,6 @@ def evaluate_uplift_metrics(
     }
 
 
-# Default colors for Qini curve plots (same order as typical use: models then Random).
-# Matplotlib default cycle first 4 + gray for baseline.
-QINI_CURVE_COLORS = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"]
-
-
 def get_qini_curve_single(
     y_true: np.ndarray,
     treatment: np.ndarray,
@@ -2941,7 +2310,9 @@ def compute_qini_curve_with_baseline(
     )
     rng = np.random.default_rng(random_state)
     rand_scores = rng.permutation(np.arange(len(y_ret), dtype=float))
-    _, random_vals = get_qini_curve_single(y_ret, treatment, rand_scores, n_points=n_points)
+    _, random_vals = get_qini_curve_single(
+        y_ret, treatment, rand_scores, n_points=n_points
+    )
     return frac, model_vals, random_vals
 
 
@@ -2974,7 +2345,11 @@ def aggregate_qini_curves_over_folds(
     stacked = np.array([c[1] for c in curves_per_fold])
     frac = curves_per_fold[0][0]
     mean_vals = np.nanmean(stacked, axis=0)
-    std_vals = np.nanstd(stacked, axis=0) if stacked.shape[0] > 1 else np.full(frac.shape[0], np.nan)
+    std_vals = (
+        np.nanstd(stacked, axis=0)
+        if stacked.shape[0] > 1
+        else np.full(frac.shape[0], np.nan)
+    )
     return frac, mean_vals, std_vals
 
 
@@ -3016,8 +2391,6 @@ def get_validation_qini_curves(
     dict[str, (fractions, mean_vals, std_vals)]
         Keys: model name or "Random baseline".
     """
-    from sklearn.model_selection import StratifiedKFold
-
     stratify = 2 * treatment + y
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
     splits = list(skf.split(X, stratify))
@@ -3045,16 +2418,21 @@ def get_validation_qini_curves(
                 y_val = y[val_idx]
                 t_val = treatment[val_idx]
                 base_params_curves: dict | None = None
-                if base_key == "XGB":
+                if base_key in ("XGB", "LGBM"):
                     best_n = _early_stopping_n_estimators_single(
-                        X_tr, y[train_idx], treatment[train_idx],
+                        X_tr,
+                        y[train_idx],
+                        treatment[train_idx],
+                        base_key=base_key,
                         base_params={},
                         scale_pos_weight=scale_pos_weight,
                         random_state=random_state,
                         n_estimators_max=800,
                     )
                     base_params_curves = {"n_estimators": best_n}
-                model = build_model(meta_key, base_key, scale_pos_weight, base_params=base_params_curves)
+                model = build_model(
+                    meta_key, base_key, scale_pos_weight, base_params=base_params_curves
+                )
                 model.fit(X_tr, treatment[train_idx], y[train_idx])
                 pred = model.predict(X_val)
                 raw_pred = np.asarray(pred).ravel()
@@ -3068,9 +2446,13 @@ def get_validation_qini_curves(
                 # = E[retention|T=1] - E[retention|T=0] → positive for persuadables.
                 neg_pred = -raw_pred
                 retention = 1 - y_val
-                frac, vals = get_qini_curve_single(retention, t_val, neg_pred, n_points=n_points)
+                frac, vals = get_qini_curve_single(
+                    retention, t_val, neg_pred, n_points=n_points
+                )
                 curves_fold.append((frac, vals))
-            frac, mean_vals, std_vals = aggregate_qini_curves_over_folds(curves_fold, n_points=n_points)
+            frac, mean_vals, std_vals = aggregate_qini_curves_over_folds(
+                curves_fold, n_points=n_points
+            )
             result[name] = (frac, mean_vals, std_vals)
 
         # Random baseline: one random permutation per fold (still use retention outcome)
@@ -3080,17 +2462,25 @@ def get_validation_qini_curves(
             t_val = treatment[val_idx]
             n_val = len(y_val)
             retention = 1 - y_val
-            random_pred = rng.permutation(np.arange(n_val, dtype=float))  # shuffle indices as proxy
-            frac, vals = get_qini_curve_single(retention, t_val, random_pred, n_points=n_points)
+            random_pred = rng.permutation(
+                np.arange(n_val, dtype=float)
+            )  # shuffle indices as proxy
+            frac, vals = get_qini_curve_single(
+                retention, t_val, random_pred, n_points=n_points
+            )
             curves_fold.append((frac, vals))
-        frac, mean_vals, std_vals = aggregate_qini_curves_over_folds(curves_fold, n_points=n_points)
+        frac, mean_vals, std_vals = aggregate_qini_curves_over_folds(
+            curves_fold, n_points=n_points
+        )
         result["Random baseline"] = (frac, mean_vals, std_vals)
 
     return result
 
 
 def plot_qini_curves_comparison(
-    curves: dict[str, tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, np.ndarray]],
+    curves: dict[
+        str, tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, np.ndarray]
+    ],
     ax: plt.Axes | None = None,
     save_path: str | Path | None = None,
     colors: list[str] | None = None,
@@ -3138,7 +2528,9 @@ def plot_qini_curves_comparison(
         y_end = 0.0
 
     # Draw diagonal random baseline first (gray dashed, like reference Qini plots).
-    ax.plot([0, 1], [0, y_end], "--", color="gray", linewidth=2, label="Random baseline")
+    ax.plot(
+        [0, 1], [0, y_end], "--", color="gray", linewidth=2, label="Random baseline"
+    )
 
     # Plot model curves (skip empirical "Random baseline" curve; diagonal is the baseline).
     color_index = 0
@@ -3166,7 +2558,9 @@ def plot_qini_curves_comparison(
             fontsize="small",
             frameon=True,
         )
-        plt.tight_layout(rect=[0, 0.22, 1, 1])  # leave room for legend below (2-col, many rows)
+        plt.tight_layout(
+            rect=[0, 0.22, 1, 1]
+        )  # leave room for legend below (2-col, many rows)
     else:
         ax.legend(loc="best", frameon=True)
         plt.tight_layout()
@@ -3273,8 +2667,6 @@ def _run_uplift_cv_loop(
     results_ref: list,
 ) -> None:
     """Inner loop of run_uplift_cv (fit/predict per candidate per fold). Called with warning filter active."""
-    from sklearn.model_selection import StratifiedKFold
-
     if uplift_k_fracs is None:
         uplift_k_fracs = [0.05, 0.1, 0.2]
     X_df = X if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
@@ -3291,16 +2683,21 @@ def _run_uplift_cv_loop(
             n_control_val = int((t_val == 0).sum())
             # For XGB, apply early stopping so n_estimators is chosen by validation (same in all flows).
             base_params_cv: dict | None = None
-            if base_key == "XGB":
+            if base_key in ("XGB", "LGBM"):
                 best_n = _early_stopping_n_estimators_single(
-                    X_tr, y_tr, t_tr,
+                    X_tr,
+                    y_tr,
+                    t_tr,
+                    base_key=base_key,
                     base_params={},
                     scale_pos_weight=scale_pos_weight,
                     random_state=random_state,
                     n_estimators_max=800,
                 )
                 base_params_cv = {"n_estimators": best_n}
-            model = build_model(meta_key, base_key, scale_pos_weight, base_params=base_params_cv)
+            model = build_model(
+                meta_key, base_key, scale_pos_weight, base_params=base_params_cv
+            )
             model.fit(X_tr, t_tr, y_tr)
             pred = model.predict(X_val)
             # CausalML predict returns CATE = E[Y|T=1] - E[Y|T=0].
@@ -3336,43 +2733,6 @@ def _run_uplift_cv_loop(
                 key = f"uplift_at_k_{int(frac * 100)}"
                 row[key] = uplift_at_k(y_val, t_val, neg_pred, frac)
             results_ref.append(row)
-
-
-def summarize_uplift_cv(
-    cv_results: list[dict],
-    metric_cols: list[str] | None = None,
-) -> pd.DataFrame:
-    """Aggregate per-candidate CV metrics (mean and std).
-
-    Parameters
-    ----------
-    cv_results : list of dict
-        Output from run_uplift_cv.
-    metric_cols : list of str or None
-        Columns to aggregate. Default: auuc, qini, uplift_at_k_5, uplift_at_k_10, uplift_at_k_20.
-
-    Returns
-    -------
-    pd.DataFrame
-        One row per candidate; columns candidate, and for each metric: mean, std.
-    """
-    if metric_cols is None:
-        metric_cols = [
-            "auuc",
-            "qini",
-            "uplift_at_k_5",
-            "uplift_at_k_10",
-            "uplift_at_k_20",
-        ]
-    df = pd.DataFrame(cv_results)
-    present = [m for m in metric_cols if m in df.columns]
-    agg_dict: dict = {}
-    for m in present:
-        agg_dict[f"{m}_mean"] = (m, "mean")
-        agg_dict[f"{m}_std"] = (m, "std")
-    if not agg_dict:
-        return df.groupby("candidate").first().reset_index()
-    return df.groupby("candidate").agg(**agg_dict).reset_index()
 
 
 def build_uplift_cv_comparison_table(
@@ -3543,22 +2903,6 @@ def save_uplift_cv_report(
         plt.close(fig3)
 
 
-def select_best_uplift_model(
-    cv_summary: pd.DataFrame,
-    metric: str = "auuc",
-    higher_is_better: bool = True,
-) -> str:
-    """Return the best candidate name by a given metric (e.g. auuc_mean). Optional; no auto-selection in Section 5."""
-    mean_col = f"{metric}_mean" if f"{metric}_mean" in cv_summary.columns else metric
-    if mean_col not in cv_summary.columns:
-        raise ValueError(f"Metric column {mean_col} not in cv_summary")
-    if higher_is_better:
-        best_idx = cv_summary[mean_col].idxmax()
-    else:
-        best_idx = cv_summary[mean_col].idxmin()
-    return str(cv_summary.loc[best_idx, "candidate"])
-
-
 # ---------------------------------------------------------------------------
 # Hyperparameter Tuning — Grid Search (Section 6)
 # ---------------------------------------------------------------------------
@@ -3605,7 +2949,9 @@ def get_uplift_hp_grid(base_key: str) -> dict[str, list]:
             "feature_fraction": [0.8, 1.0],
             "min_gain_to_split": [0.1, 0.2, 0.3],
         }
-    raise ValueError(f"Unknown base_key for HP grid: {base_key!r}. Use one of Ridge, Lasso, ElasticNet, LGBM.")
+    raise ValueError(
+        f"Unknown base_key for HP grid: {base_key!r}. Use one of Ridge, Lasso, ElasticNet, LGBM."
+    )
 
 
 def run_uplift_hp_grid_search(
@@ -3657,8 +3003,6 @@ def run_uplift_hp_grid_search(
         One dict per (param_combo, fold) with keys: params_str, fold, auuc,
         qini, uplift_at_k_*, plus each individual hyperparameter.
     """
-    import itertools
-
     if uplift_k_fracs is None:
         uplift_k_fracs = [0.05, 0.1, 0.2]
 
@@ -3683,8 +3027,6 @@ def run_uplift_hp_grid_search(
     n_combos = len(combos)
 
     # Prepare StratifiedKFold (same stratification as Section 5)
-    from sklearn.model_selection import StratifiedKFold
-
     stratify = 2 * treatment + y
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
     splits = list(skf.split(X, stratify))
@@ -3708,12 +3050,15 @@ def run_uplift_hp_grid_search(
                 y_tr, y_val = y[train_idx], y[val_idx]
                 t_tr, t_val = treatment[train_idx], treatment[val_idx]
 
-                # For XGB, set n_estimators via early stopping on this fold's train set (same in all flows).
+                # For XGB/LGBM, set n_estimators via early stopping on this fold's train set (same in all flows).
                 params_fold = dict(params)
-                if base_key == "XGB":
+                if base_key in ("XGB", "LGBM"):
                     n_max = params_fold.get("n_estimators", 800)
                     best_n = _early_stopping_n_estimators_single(
-                        X_tr, y_tr, t_tr,
+                        X_tr,
+                        y_tr,
+                        t_tr,
+                        base_key=base_key,
                         base_params=params_fold,
                         scale_pos_weight=scale_pos_weight,
                         random_state=random_state,
@@ -3781,7 +3126,13 @@ def build_hp_grid_search_table(
         One row per combo, sorted by descending auuc_mean.
     """
     if metric_cols is None:
-        metric_cols = ["auuc", "qini", "uplift_at_k_5", "uplift_at_k_10", "uplift_at_k_20"]
+        metric_cols = [
+            "auuc",
+            "qini",
+            "uplift_at_k_5",
+            "uplift_at_k_10",
+            "uplift_at_k_20",
+        ]
     df = pd.DataFrame(grid_results)
     present = [m for m in metric_cols if m in df.columns]
     agg_dict: dict = {}
@@ -3791,7 +3142,9 @@ def build_hp_grid_search_table(
     summary = df.groupby("params_str").agg(**agg_dict).reset_index()
     # Sort by primary metric descending
     if "auuc_mean" in summary.columns:
-        summary = summary.sort_values("auuc_mean", ascending=False).reset_index(drop=True)
+        summary = summary.sort_values("auuc_mean", ascending=False).reset_index(
+            drop=True
+        )
     return summary
 
 
@@ -3799,6 +3152,7 @@ def compute_early_stopping_n_estimators(
     X: pd.DataFrame | np.ndarray,
     y: np.ndarray,
     treatment: np.ndarray,
+    base_key: str,
     base_params: dict,
     scale_pos_weight: float = 1.0,
     n_splits: int = 5,
@@ -3807,16 +3161,16 @@ def compute_early_stopping_n_estimators(
     early_stopping_rounds: int = 15,
     n_estimators_max: int = 800,
 ) -> list[int]:
-    """Compute per-fold best iteration via early stopping for S-learner + XGBoost.
+    """Compute per-fold best iteration via early stopping for S-learner + XGB or LGBM.
 
     Uses the same CV splits as the grid search. Within each fold's training set,
-    an inner train/validation split is used so the base XGB is fit with
+    an inner train/validation split is used so the base tree model is fit with
     eval_set and early_stopping_rounds. Returns the list of best_iteration
     per fold; the caller typically uses median(best_rounds) as n_estimators
     when training the final model on 100% of the data.
 
-    Only supports S-learner with XGBoost (meta_key='S', base_key='XGB'). The
-    internal design matrix is [treatment_indicator | X] as in CausalML.
+    Supports base_key in ('XGB', 'LGBM'). The internal design matrix is
+    [treatment_indicator | X] as in CausalML.
 
     Parameters
     ----------
@@ -3826,12 +3180,13 @@ def compute_early_stopping_n_estimators(
         Binary outcome (churn 0/1).
     treatment : np.ndarray
         Treatment indicator (1 = treated, 0 = control).
+    base_key : str
+        One of 'XGB', 'LGBM'.
     base_params : dict
-        Base-learner hyperparameters (e.g. from grid search best). Must include
-        max_depth, learning_rate, etc. n_estimators is overridden by
-        n_estimators_max for the inner fits.
+        Base-learner hyperparameters (e.g. from grid search best). n_estimators
+        is overridden by n_estimators_max for the inner fits.
     scale_pos_weight : float
-        Passed to XGBRegressor (for class balance).
+        Passed to XGBRegressor (for class balance); ignored for LGBM.
     n_splits : int
         Number of CV folds (must match Section 5/6).
     random_state : int
@@ -3841,7 +3196,7 @@ def compute_early_stopping_n_estimators(
     early_stopping_rounds : int
         Stop if validation metric does not improve for this many rounds.
     n_estimators_max : int
-        Maximum number of trees for the inner XGB fit.
+        Maximum number of trees for the inner fit.
 
     Returns
     -------
@@ -3849,10 +3204,14 @@ def compute_early_stopping_n_estimators(
         One best_iteration per fold. Use e.g. int(np.median(result)) for final
         n_estimators.
     """
-    from sklearn.model_selection import StratifiedKFold, train_test_split
-
-    if XGBRegressor is None:
-        raise ImportError("xgboost is required for early stopping")
+    if base_key == "XGB" and XGBRegressor is None:
+        raise ImportError("xgboost is required for XGB early stopping")
+    if base_key == "LGBM" and LGBMRegressor is None:
+        raise ImportError("lightgbm is required for LGBM early stopping")
+    if base_key not in ("XGB", "LGBM"):
+        raise ValueError(
+            f"compute_early_stopping_n_estimators requires base_key in ('XGB','LGBM'), got {base_key!r}"
+        )
     y_ = np.asarray(y, dtype=np.float64)
     t_ = np.asarray(treatment, dtype=np.float64)
     valid = np.isfinite(y_) & np.isin(t_, (0.0, 1.0)) & np.isin(y_, (0.0, 1.0))
@@ -3901,23 +3260,42 @@ def compute_early_stopping_n_estimators(
         w_val = (t_val == 1).astype(np.float64).reshape(-1, 1)
         X_tr_new = np.hstack([w_tr, X_tr])
         X_val_new = np.hstack([w_val, X_val])
-        # XGBoost 2.x/3.x: early_stopping_rounds is a constructor arg, not fit()
-        xgb = XGBRegressor(
-            random_state=random_state,
-            scale_pos_weight=scale_pos_weight,
-            verbosity=0,
-            early_stopping_rounds=early_stopping_rounds,
-            **params,
-        )
-        xgb.fit(
-            X_tr_new,
-            y_tr,
-            eval_set=[(X_val_new, y_val)],
-            verbose=False,
-        )
-        best = getattr(xgb, "best_iteration", None) or getattr(
-            xgb, "best_ntree_limit", None
-        )
+        if base_key == "XGB":
+            # XGBoost 2.x/3.x: early_stopping_rounds is a constructor arg, not fit()
+            xgb = XGBRegressor(
+                random_state=random_state,
+                scale_pos_weight=scale_pos_weight,
+                verbosity=0,
+                early_stopping_rounds=early_stopping_rounds,
+                **params,
+            )
+            xgb.fit(
+                X_tr_new,
+                y_tr,
+                eval_set=[(X_val_new, y_val)],
+                verbose=False,
+            )
+            best = getattr(xgb, "best_iteration", None) or getattr(
+                xgb, "best_ntree_limit", None
+            )
+        else:
+            lgbm = LGBMRegressor(
+                random_state=random_state,
+                verbose=-1,
+                **params,
+            )
+            lgbm.fit(
+                X_tr_new,
+                y_tr,
+                eval_set=[(X_val_new, y_val)],
+                callbacks=[
+                    lgb.early_stopping(
+                        stopping_rounds=early_stopping_rounds, verbose=False
+                    ),
+                    lgb.log_evaluation(period=0),
+                ],
+            )
+            best = getattr(lgbm, "best_iteration_", None)
         if best is not None:
             best_rounds.append(int(best))
         else:
@@ -3929,6 +3307,7 @@ def _early_stopping_n_estimators_single(
     X_tr: np.ndarray | pd.DataFrame,
     y_tr: np.ndarray,
     t_tr: np.ndarray,
+    base_key: str,
     base_params: dict,
     scale_pos_weight: float,
     random_state: int,
@@ -3938,10 +3317,9 @@ def _early_stopping_n_estimators_single(
 ) -> int:
     """Compute best n_estimators for a single training set via inner train/val early stopping.
 
-    Used whenever an S+XGB model is fitted (CV, grid search, final fit) so that
-    early stopping is applied consistently. Does one inner stratified split,
-    builds S-learner design matrix [treatment | X], fits XGB with eval_set,
-    returns best_iteration (or best_ntree_limit).
+    Used whenever an S+XGB or S+LGBM model is fitted (CV, grid search, final fit).
+    Does one inner stratified split, builds S-learner design matrix [treatment | X],
+    fits XGB or LGBM with eval_set and early stopping, returns best_iteration.
 
     Parameters
     ----------
@@ -3949,11 +3327,13 @@ def _early_stopping_n_estimators_single(
         Training feature matrix for this fold/split.
     y_tr, t_tr : np.ndarray
         Training outcome and treatment.
+    base_key : str
+        One of 'XGB', 'LGBM'.
     base_params : dict
         Base-learner hyperparameters. n_estimators is set to n_estimators_max
-        for the inner fit; other keys passed to XGBRegressor.
+        for the inner fit; other keys passed to XGBRegressor or LGBMRegressor.
     scale_pos_weight : float
-        Passed to XGBRegressor.
+        Passed to XGBRegressor (ignored for LGBM).
     random_state : int
         Seed for inner train_test_split.
     inner_val_frac : float
@@ -3968,16 +3348,19 @@ def _early_stopping_n_estimators_single(
     int
         Best iteration for this training set.
     """
-    from sklearn.model_selection import train_test_split
-
-    if XGBRegressor is None:
-        raise ImportError("xgboost is required for early stopping")
+    if base_key == "XGB" and XGBRegressor is None:
+        raise ImportError("xgboost is required for XGB early stopping")
+    if base_key == "LGBM" and LGBMRegressor is None:
+        raise ImportError("lightgbm is required for LGBM early stopping")
     X_arr = np.asarray(X_tr, dtype=np.float64)
-    n_max = n_estimators_max if n_estimators_max is not None else base_params.get("n_estimators", 800)
+    n_max = (
+        n_estimators_max
+        if n_estimators_max is not None
+        else base_params.get("n_estimators", 800)
+    )
     params = dict(base_params)
     params["n_estimators"] = n_max
     stratify_inner = 2 * t_tr + y_tr
-    # Stratification requires at least 2 samples per class in both splits
     unique, counts = np.unique(stratify_inner, return_counts=True)
     can_stratify = np.all(counts >= 2)
     if can_stratify:
@@ -4003,25 +3386,45 @@ def _early_stopping_n_estimators_single(
     w_val = (t_val_inner == 1).astype(np.float64).reshape(-1, 1)
     X_tr_new = np.hstack([w_tr, X_tr_inner])
     X_val_new = np.hstack([w_val, X_val_inner])
-    # XGBoost 2.x/3.x: early_stopping_rounds is a constructor arg, not fit()
-    xgb = XGBRegressor(
-        random_state=random_state,
-        scale_pos_weight=scale_pos_weight,
-        verbosity=0,
-        early_stopping_rounds=early_stopping_rounds,
-        **params,
-    )
-    xgb.fit(
-        X_tr_new,
-        y_tr_inner,
-        eval_set=[(X_val_new, y_val_inner)],
-        verbose=False,
-    )
-    best = getattr(xgb, "best_iteration", None) or getattr(xgb, "best_ntree_limit", None)
+    if base_key == "XGB":
+        xgb = XGBRegressor(
+            random_state=random_state,
+            scale_pos_weight=scale_pos_weight,
+            verbosity=0,
+            early_stopping_rounds=early_stopping_rounds,
+            **params,
+        )
+        xgb.fit(
+            X_tr_new,
+            y_tr_inner,
+            eval_set=[(X_val_new, y_val_inner)],
+            verbose=False,
+        )
+        best = getattr(xgb, "best_iteration", None) or getattr(
+            xgb, "best_ntree_limit", None
+        )
+    else:
+        lgbm = LGBMRegressor(
+            random_state=random_state,
+            verbose=-1,
+            **params,
+        )
+        lgbm.fit(
+            X_tr_new,
+            y_tr_inner,
+            eval_set=[(X_val_new, y_val_inner)],
+            callbacks=[
+                lgb.early_stopping(
+                    stopping_rounds=early_stopping_rounds, verbose=False
+                ),
+                lgb.log_evaluation(period=0),
+            ],
+        )
+        best = getattr(lgbm, "best_iteration_", None)
     return int(best) if best is not None else n_max
 
 
-def fit_final_slearner(
+def fit_final_learner(
     X: pd.DataFrame | np.ndarray,
     y: np.ndarray,
     treatment: np.ndarray,
@@ -4035,9 +3438,9 @@ def fit_final_slearner(
     inner_val_frac: float = 0.2,
     n_estimators_max: int = 800,
 ):
-    """Build and fit the final meta-learner on the full dataset, with early stopping for XGB.
+    """Build and fit the final meta-learner on the full dataset, with early stopping for XGB/LGBM.
 
-    For base_key == 'XGB', runs compute_early_stopping_n_estimators to get
+    For base_key in ('XGB', 'LGBM'), runs compute_early_stopping_n_estimators to get
     per-fold best iterations, sets n_estimators = median(best_rounds), then
     builds and fits. For linear models (Ridge/Lasso/ElasticNet) early
     stopping is skipped — the Pipeline inside build_model handles NaN
@@ -4057,10 +3460,13 @@ def fit_final_slearner(
     Fitted CausalML meta-learner (e.g. BaseSRegressor).
     """
     base_params = dict(base_params)
-    # Early stopping only applies to XGB; linear models and LGBM skip this
-    if base_key == "XGB":
+    # Early stopping for XGB and LGBM; linear models skip this
+    if base_key in ("XGB", "LGBM"):
         best_rounds = compute_early_stopping_n_estimators(
-            X, y, treatment,
+            X,
+            y,
+            treatment,
+            base_key=base_key,
             base_params=base_params,
             scale_pos_weight=scale_pos_weight,
             n_splits=n_splits,
@@ -4123,8 +3529,6 @@ def get_qini_curves_top_hp_combos(
     -------
     dict[params_str, (fractions, mean_vals, std_vals)]
     """
-    from sklearn.model_selection import StratifiedKFold
-
     param_names = sorted(param_grid.keys())
     top_params_str = grid_summary.head(top_n)["params_str"].tolist()
     # Recover param dict for each params_str from first occurrence in grid_results
@@ -4152,26 +3556,35 @@ def get_qini_curves_top_hp_combos(
                 y_val = y[val_idx]
                 t_val = treatment[val_idx]
                 params_fold = dict(params)
-                if base_key == "XGB":
+                if base_key in ("XGB", "LGBM"):
                     n_max = params_fold.get("n_estimators", 800)
                     best_n = _early_stopping_n_estimators_single(
-                        X_tr, y[train_idx], treatment[train_idx],
+                        X_tr,
+                        y[train_idx],
+                        treatment[train_idx],
+                        base_key=base_key,
                         base_params=params_fold,
                         scale_pos_weight=scale_pos_weight,
                         random_state=random_state,
                         n_estimators_max=n_max,
                     )
                     params_fold["n_estimators"] = best_n
-                model = build_model(meta_key, base_key, scale_pos_weight, base_params=params_fold)
+                model = build_model(
+                    meta_key, base_key, scale_pos_weight, base_params=params_fold
+                )
                 model.fit(X_tr, treatment[train_idx], y[train_idx])
                 pred = model.predict(X_val)
                 raw_pred = np.asarray(pred).ravel()
                 # Churn → retention for Qini (see get_validation_qini_curves for rationale)
                 neg_pred = -raw_pred
                 retention = 1 - y_val
-                frac, vals = get_qini_curve_single(retention, t_val, neg_pred, n_points=n_points)
+                frac, vals = get_qini_curve_single(
+                    retention, t_val, neg_pred, n_points=n_points
+                )
                 curves_fold.append((frac, vals))
-            frac, mean_vals, std_vals = aggregate_qini_curves_over_folds(curves_fold, n_points=n_points)
+            frac, mean_vals, std_vals = aggregate_qini_curves_over_folds(
+                curves_fold, n_points=n_points
+            )
             result[params_str] = (frac, mean_vals, std_vals)
 
     return result
@@ -4260,7 +3673,13 @@ def plot_cumulative_uplift_curve(
     if show_random and valid.sum() > 0:
         # Random targeting = constant uplift equal to overall uplift (at 100%)
         overall = uplift_vals[valid][-1] if valid.any() else 0.0
-        ax.axhline(overall, linestyle="--", color="gray", linewidth=1.5, label="Random baseline")
+        ax.axhline(
+            overall,
+            linestyle="--",
+            color="gray",
+            linewidth=1.5,
+            label="Random baseline",
+        )
     ax.set_xlabel("Proportion targeted")
     ax.set_ylabel("Realised uplift (control − treated)")
     ax.set_title(title)
@@ -4393,8 +3812,6 @@ def compute_train_holdout_uplift_data(
         ks_tr, uplift_vals_tr : cumulative uplift curve (train)
         ks_ho, uplift_vals_ho : cumulative uplift curve (holdout)
     """
-    from sklearn.model_selection import StratifiedKFold
-
     # One stratified split: use first fold of 5-fold so train ≈ 80%, holdout ≈ 20%
     n_splits = max(2, int(round(1 / (1 - train_frac))))  # 5 for train_frac=0.8
     stratify = 2 * np.asarray(treatment, dtype=np.int64) + np.asarray(y, dtype=np.int64)
@@ -4412,8 +3829,10 @@ def compute_train_holdout_uplift_data(
     treatment_ho = treatment[holdout_idx]
 
     # Fit on train portion only (same API as fit_final_slearner)
-    model_80 = fit_final_slearner(
-        X_tr, y_tr, treatment_tr,
+    model_80 = fit_final_learner(
+        X_tr,
+        y_tr,
+        treatment_tr,
         meta_key=meta_key,
         base_key=base_key,
         base_params=dict(base_params),
@@ -4423,14 +3842,22 @@ def compute_train_holdout_uplift_data(
     )
 
     # Predict CATE on both portions; uplift score = -CATE for churn (higher = better)
-    cate_tr = np.asarray(model_80.predict(X=np.asarray(X_tr), treatment=treatment_tr)).ravel()
-    cate_ho = np.asarray(model_80.predict(X=np.asarray(X_ho), treatment=treatment_ho)).ravel()
+    cate_tr = np.asarray(
+        model_80.predict(X=np.asarray(X_tr), treatment=treatment_tr)
+    ).ravel()
+    cate_ho = np.asarray(
+        model_80.predict(X=np.asarray(X_ho), treatment=treatment_ho)
+    ).ravel()
     uplift_scores_tr = -cate_tr
     uplift_scores_ho = -cate_ho
 
     # Cumulative uplift curves
-    ks_tr, uplift_vals_tr = uplift_curve(y_tr, treatment_tr, uplift_scores_tr, n_points=n_points)
-    ks_ho, uplift_vals_ho = uplift_curve(y_ho, treatment_ho, uplift_scores_ho, n_points=n_points)
+    ks_tr, uplift_vals_tr = uplift_curve(
+        y_tr, treatment_tr, uplift_scores_tr, n_points=n_points
+    )
+    ks_ho, uplift_vals_ho = uplift_curve(
+        y_ho, treatment_ho, uplift_scores_ho, n_points=n_points
+    )
 
     return {
         "model_80": model_80,
@@ -4488,11 +3915,30 @@ def plot_cumulative_uplift_curve_train_holdout(
         _, ax = plt.subplots(figsize=(8, 5))
     valid_tr = ~np.isnan(uplift_vals_tr)
     valid_ho = ~np.isnan(uplift_vals_ho)
-    ax.plot(ks_tr[valid_tr], uplift_vals_tr[valid_tr], linewidth=2, label=label_train, color="#1f77b4")
-    ax.plot(ks_ho[valid_ho], uplift_vals_ho[valid_ho], linewidth=2, label=label_holdout, color="#ff7f0e")
+    ax.plot(
+        ks_tr[valid_tr],
+        uplift_vals_tr[valid_tr],
+        linewidth=2,
+        label=label_train,
+        color="#1f77b4",
+    )
+    ax.plot(
+        ks_ho[valid_ho],
+        uplift_vals_ho[valid_ho],
+        linewidth=2,
+        label=label_holdout,
+        color="#ff7f0e",
+    )
     if valid_tr.sum() > 0:
         overall_tr = uplift_vals_tr[valid_tr][-1]
-        ax.axhline(overall_tr, linestyle="--", color="gray", linewidth=1, alpha=0.7, label="Random baseline")
+        ax.axhline(
+            overall_tr,
+            linestyle="--",
+            color="gray",
+            linewidth=1,
+            alpha=0.7,
+            label="Random baseline",
+        )
     ax.set_xlabel("Proportion targeted")
     ax.set_ylabel("Realised uplift (control − treated)")
     ax.set_title(title)
@@ -4543,8 +3989,12 @@ def plot_uplift_by_decile_train_holdout(
     ax1, ax2 : matplotlib.axes.Axes
     """
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
-    plot_uplift_by_decile(y_tr, treatment_tr, uplift_scores_tr, n_bins=n_bins, ax=ax1, title=label_train)
-    plot_uplift_by_decile(y_ho, treatment_ho, uplift_scores_ho, n_bins=n_bins, ax=ax2, title=label_holdout)
+    plot_uplift_by_decile(
+        y_tr, treatment_tr, uplift_scores_tr, n_bins=n_bins, ax=ax1, title=label_train
+    )
+    plot_uplift_by_decile(
+        y_ho, treatment_ho, uplift_scores_ho, n_bins=n_bins, ax=ax2, title=label_holdout
+    )
     fig.suptitle(title, fontsize=12, y=1.02)
     plt.tight_layout()
     if save_path is not None:
@@ -4553,70 +4003,6 @@ def plot_uplift_by_decile_train_holdout(
 
 
 # --- Test-set visualisations (prediction-only, no labels needed) -----------
-
-
-def plot_segment_counts(
-    segments: np.ndarray,
-    ax: plt.Axes | None = None,
-    as_percent: bool = True,
-    title: str = "Population segments",
-    save_path: str | Path | None = None,
-) -> plt.Axes:
-    """Bar chart of count or percentage per uplift segment.
-
-    Generic: works with any categorical segment array (e.g. from
-    :func:`assign_segments` or a SHAP-based segmentation).
-
-    Parameters
-    ----------
-    segments : np.ndarray of str
-        Segment label per observation (e.g. "Persuadables", "Sure Things", …).
-    ax : plt.Axes or None
-        Axes to plot on; created if None.
-    as_percent : bool
-        If True, plot percentage; otherwise raw counts.
-    title : str
-        Plot title.
-    save_path : str, Path, or None
-        If provided, save figure to this path.
-
-    Returns
-    -------
-    plt.Axes
-    """
-    if ax is None:
-        _, ax = plt.subplots(figsize=(7, 4))
-    # Fixed display order: Persuadables first, Do-Not-Disturb last
-    seg_order = ["Persuadables", "Sure Things", "Lost Causes", "Do-Not-Disturb"]
-    seg_series = pd.Series(segments)
-    counts = seg_series.value_counts()
-    vals = [counts.get(s, 0) for s in seg_order]
-    if as_percent:
-        total = max(1, len(segments))
-        vals = [v / total * 100 for v in vals]
-        ylabel = "% of population"
-    else:
-        ylabel = "Count"
-    seg_colors = ["#2ca02c", "#1f77b4", "#ff7f0e", "#d62728"]
-    bars = ax.bar(seg_order, vals, color=seg_colors, edgecolor="white", linewidth=0.5)
-    # Annotate each bar
-    for bar, v in zip(bars, vals):
-        fmt = f"{v:.1f}%" if as_percent else f"{int(v):,}"
-        ax.text(
-            bar.get_x() + bar.get_width() / 2,
-            bar.get_height() + max(vals) * 0.02,
-            fmt,
-            ha="center",
-            va="bottom",
-            fontsize=10,
-        )
-    ax.set_ylabel(ylabel)
-    ax.set_title(title)
-    set_axes_clear(ax, x_axis_at_zero=False)
-    plt.tight_layout()
-    if save_path is not None:
-        ax.figure.savefig(Path(save_path), bbox_inches="tight", dpi=150)
-    return ax
 
 
 def plot_uplift_by_segment(
@@ -4673,78 +4059,6 @@ def plot_uplift_by_segment(
     return ax
 
 
-def plot_cumulative_uplift_by_segment(
-    segments: np.ndarray,
-    uplift_scores: np.ndarray,
-    n_points: int = 100,
-    ax: plt.Axes | None = None,
-    title: str = "Cumulative predicted uplift by segment",
-    save_path: str | Path | None = None,
-) -> plt.Axes:
-    """Four curves: cumulative predicted uplift contribution by segment.
-
-    Segments follow formal definitions (Persuadables = positive uplift, etc.).
-    Sorts population by *uplift_scores* (descending). At each proportion
-    targeted x, computes the cumulative **sum** of predicted uplift in the
-    top x%, split by segment. The four curves show how much each segment
-    contributes as the targeting budget expands.
-
-    Generic: works with any score + segment arrays (e.g. SHAP-based).
-
-    Parameters
-    ----------
-    segments : np.ndarray of str
-        Segment label per observation.
-    uplift_scores : np.ndarray
-        Predicted uplift (higher = target first).
-    n_points : int
-        Number of evaluation points along proportion axis.
-    ax : plt.Axes or None
-        Axes to plot on; created if None.
-    title : str
-        Plot title.
-    save_path : str, Path, or None
-        If provided, save figure to this path.
-
-    Returns
-    -------
-    plt.Axes
-    """
-    if ax is None:
-        _, ax = plt.subplots(figsize=(8, 5))
-    seg_order = ["Persuadables", "Sure Things", "Lost Causes", "Do-Not-Disturb"]
-    seg_colors = ["#2ca02c", "#1f77b4", "#ff7f0e", "#d62728"]
-    # Sort by descending score
-    order = np.argsort(-uplift_scores)
-    scores_sorted = uplift_scores[order]
-    segs_sorted = segments[order]
-    n_total = len(scores_sorted)
-    fracs = np.linspace(0.01, 1.0, n_points)
-    # Build cumulative sums per segment
-    cum_by_seg = {s: np.zeros(n_points) for s in seg_order}
-    for i, frac in enumerate(fracs):
-        n = max(1, int(n_total * frac))
-        sc_slice = scores_sorted[:n]
-        seg_slice = segs_sorted[:n]
-        for s in seg_order:
-            mask = seg_slice == s
-            cum_by_seg[s][i] = float(sc_slice[mask].sum()) if mask.any() else 0.0
-    # Normalise by population size so y-axis is "mean cumulative uplift per person"
-    for s in seg_order:
-        cum_by_seg[s] /= max(1, n_total)
-    for s, color in zip(seg_order, seg_colors):
-        ax.plot(fracs, cum_by_seg[s], linewidth=2, label=s, color=color)
-    ax.set_xlabel("Proportion targeted (by predicted uplift)")
-    ax.set_ylabel("Cumulative predicted uplift (per person)")
-    ax.set_title(title)
-    ax.legend(loc="best", frameon=True)
-    set_axes_clear(ax, x_axis_at_zero=False)
-    plt.tight_layout()
-    if save_path is not None:
-        ax.figure.savefig(Path(save_path), bbox_inches="tight", dpi=150)
-    return ax
-
-
 def export_top_fraction(
     member_ids: np.ndarray | pd.Series,
     uplift_scores: np.ndarray,
@@ -4775,10 +4089,12 @@ def export_top_fraction(
     """
     n = max(1, int(len(uplift_scores) * fraction))
     order = np.argsort(-np.asarray(uplift_scores))[:n]
-    df = pd.DataFrame({
-        "member_id": np.asarray(member_ids)[order],
-        "prioritization_score": np.asarray(uplift_scores)[order],
-    })
+    df = pd.DataFrame(
+        {
+            "member_id": np.asarray(member_ids)[order],
+            "prioritization_score": np.asarray(uplift_scores)[order],
+        }
+    )
     df = df.sort_values("prioritization_score", ascending=False).reset_index(drop=True)
     df["rank"] = np.arange(1, len(df) + 1)
     out_path = Path(out_path)
@@ -4875,9 +4191,6 @@ def _fix_xgboost_base_score_for_shap(base_model) -> None:
     -------
     None
     """
-    import json
-    import tempfile
-
     try:
         booster = base_model.get_booster()
     except Exception:
@@ -4935,10 +4248,8 @@ def _fix_xgboost_base_score_for_shap(base_model) -> None:
 
 def _is_pipeline_linear(base_model) -> bool:
     """Check if a base model is a sklearn Pipeline ending with a linear model."""
-    from sklearn.pipeline import Pipeline
     if isinstance(base_model, Pipeline):
         final_step = base_model.steps[-1][1]
-        from sklearn.linear_model import Ridge, Lasso, ElasticNet, LinearRegression
         return isinstance(final_step, (Ridge, Lasso, ElasticNet, LinearRegression))
     return False
 
@@ -4964,10 +4275,11 @@ def _make_shap_explainer_for_base(base_model, X_background: np.ndarray):
         A SHAP explainer appropriate for the model type.
     """
     if _is_pipeline_linear(base_model):
-        # Transform background through imputer + scaler, then explain the linear model
-        from sklearn.pipeline import Pipeline
-        preprocessing = Pipeline(base_model.steps[:-1])
-        X_bg_transformed = preprocessing.transform(X_background)
+        # Use preprocessing steps if present (imputer/scaler); else data is already clean
+        pre_steps = base_model.steps[:-1]
+        X_bg_transformed = (
+            Pipeline(pre_steps).transform(X_background) if pre_steps else X_background
+        )
         linear_model = base_model.steps[-1][1]
         return shap.LinearExplainer(linear_model, X_bg_transformed)
     else:
@@ -4983,7 +4295,6 @@ def _make_shap_explainer_for_base(base_model, X_background: np.ndarray):
                 x = x[0]
             return _real_float(x)
 
-        import builtins
         try:
             builtins.float = _float_for_shap
             try:
@@ -4992,7 +4303,10 @@ def _make_shap_explainer_for_base(base_model, X_background: np.ndarray):
                 builtins.float = _real_float
         except ValueError as e:
             builtins.float = _real_float
-            if "could not convert string to float" in str(e) and "base_score" in str(e).lower():
+            if (
+                "could not convert string to float" in str(e)
+                and "base_score" in str(e).lower()
+            ):
                 _fix_xgboost_base_score_for_shap(base_model)
                 builtins.float = _float_for_shap
                 try:
@@ -5022,9 +4336,8 @@ def _shap_explain(explainer, base_model, X_data: np.ndarray) -> object:
     SHAP explanation object or array.
     """
     if _is_pipeline_linear(base_model):
-        from sklearn.pipeline import Pipeline
-        preprocessing = Pipeline(base_model.steps[:-1])
-        X_transformed = preprocessing.transform(X_data)
+        pre_steps = base_model.steps[:-1]
+        X_transformed = Pipeline(pre_steps).transform(X_data) if pre_steps else X_data
         return explainer(X_transformed)
     else:
         return explainer(X_data)
@@ -5085,7 +4398,9 @@ def compute_shap_uplift(
     elif impute_nan:
         X_clean = make_nan_free(X, reference=X)
     else:
-        X_clean = np.asarray(X, dtype=np.float64) if not isinstance(X, np.ndarray) else X
+        X_clean = (
+            np.asarray(X, dtype=np.float64) if not isinstance(X, np.ndarray) else X
+        )
     n = X_clean.shape[0]
 
     if _is_tlearner(model):
@@ -5342,9 +4657,6 @@ def compute_parshap_overfitting(
     feature_names : list[str]
         Feature names for plotting.
     """
-    from copy import deepcopy
-    from sklearn.model_selection import train_test_split
-
     X_arr = np.asarray(X, dtype=np.float64)
     if reference_X is None:
         reference_X = X_arr
@@ -5366,10 +4678,18 @@ def compute_parshap_overfitting(
     model_clone.fit(X_tr, t_tr, y_tr)
     # Compute SHAP on train and holdout using the clone
     shap_tr, _, _ = compute_shap_uplift(
-        model_clone, X_tr, feature_names=feature_names, reference_X=reference_X, impute_nan=True
+        model_clone,
+        X_tr,
+        feature_names=feature_names,
+        reference_X=reference_X,
+        impute_nan=True,
     )
     shap_ho, _, _ = compute_shap_uplift(
-        model_clone, X_ho, feature_names=feature_names, reference_X=reference_X, impute_nan=True
+        model_clone,
+        X_ho,
+        feature_names=feature_names,
+        reference_X=reference_X,
+        impute_nan=True,
     )
     shap_tr = np.asarray(shap_tr).squeeze()
     shap_ho = np.asarray(shap_ho).squeeze()
@@ -5382,8 +4702,12 @@ def compute_parshap_overfitting(
     par_holdout = np.zeros(n_features)
     for j in range(n_features):
         other_idx = [i for i in range(n_features) if i != j]
-        X_other_tr = shap_tr[:, other_idx] if other_idx else np.empty((shap_tr.shape[0], 0))
-        X_other_ho = shap_ho[:, other_idx] if other_idx else np.empty((shap_ho.shape[0], 0))
+        X_other_tr = (
+            shap_tr[:, other_idx] if other_idx else np.empty((shap_tr.shape[0], 0))
+        )
+        X_other_ho = (
+            shap_ho[:, other_idx] if other_idx else np.empty((shap_ho.shape[0], 0))
+        )
         par_train[j] = _partial_corr_one(shap_tr[:, j], y_tr, X_other_tr)
         par_holdout[j] = _partial_corr_one(shap_ho[:, j], y_ho, X_other_ho)
     par_train = np.asarray(par_train)
@@ -5426,8 +4750,6 @@ def plot_parshap_overfitting(
     save_path : str or Path or None
         If set, save the figure to this path.
     """
-    from matplotlib.colors import Normalize  # local import to avoid top-level dep
-
     par_train = np.asarray(par_train).ravel()
     par_holdout = np.asarray(par_holdout).ravel()
     n = len(par_train)
@@ -5437,19 +4759,29 @@ def plot_parshap_overfitting(
 
     # Overfitting gap: positive = train stronger than holdout = potential overfitting
     diffs = par_train - par_holdout
-    cmap = plt.cm.RdYlGn_r          # red = high diff (overfitting), green = low
+    cmap = plt.cm.RdYlGn_r  # red = high diff (overfitting), green = low
     norm = Normalize(vmin=diffs.min(), vmax=diffs.max())
 
     scatter = ax.scatter(
-        par_train, par_holdout, c=diffs, cmap=cmap, norm=norm,
-        s=90, edgecolors="black", linewidths=0.5, zorder=3,
+        par_train,
+        par_holdout,
+        c=diffs,
+        cmap=cmap,
+        norm=norm,
+        s=90,
+        edgecolors="black",
+        linewidths=0.5,
+        zorder=3,
     )
 
     # Annotate each feature with smart offset to reduce overlap
     for i, name in enumerate(feature_names):
         ax.annotate(
-            name, (par_train[i], par_holdout[i]),
-            xytext=(6, 6), textcoords="offset points", fontsize=8.5,
+            name,
+            (par_train[i], par_holdout[i]),
+            xytext=(6, 6),
+            textcoords="offset points",
+            fontsize=8.5,
             bbox=dict(boxstyle="round,pad=0.15", fc="white", alpha=0.7, lw=0),
         )
 
@@ -5462,8 +4794,13 @@ def plot_parshap_overfitting(
     # Reference lines
     ax.axhline(0, color="gray", linewidth=0.7, linestyle="-")
     ax.axvline(0, color="gray", linewidth=0.7, linestyle="-")
-    ax.plot([lim_lo, lim_hi], [lim_lo, lim_hi], "k--", linewidth=1,
-            label="y = x (no overfitting)")
+    ax.plot(
+        [lim_lo, lim_hi],
+        [lim_lo, lim_hi],
+        "k--",
+        linewidth=1,
+        label="y = x (no overfitting)",
+    )
 
     ax.set_xlabel("Partial corr. (SHAP vs target) — Train split", fontsize=11)
     ax.set_ylabel("Partial corr. (SHAP vs target) — Holdout split", fontsize=11)
@@ -5544,7 +4881,9 @@ def compute_incremental_churn_at_k(
     churn_control = y_top[control_mask].mean() if n_control > 0 else np.nan
 
     # Incremental reduction: how much churn drops from treatment
-    incremental = churn_control - churn_treated if (n_treated > 0 and n_control > 0) else np.nan
+    incremental = (
+        churn_control - churn_treated if (n_treated > 0 and n_control > 0) else np.nan
+    )
 
     # Churns prevented = incremental_rate × n_targeted
     churns_prevented = incremental * n_target if not np.isnan(incremental) else np.nan
@@ -5606,7 +4945,9 @@ def compute_lift_over_random(
     model_reduction = model_stats["incremental_churn_reduction"] * k
 
     # Lift ratio (model / random); guard against division by zero
-    lift_ratio = (model_reduction / random_reduction) if random_reduction != 0 else np.nan
+    lift_ratio = (
+        (model_reduction / random_reduction) if random_reduction != 0 else np.nan
+    )
     absolute_gain = model_reduction - random_reduction
 
     return {
@@ -5616,169 +4957,6 @@ def compute_lift_over_random(
         "lift_ratio": lift_ratio,
         "absolute_gain": absolute_gain,
     }
-
-
-def build_capacity_curve_data(
-    y: np.ndarray,
-    treatment: np.ndarray,
-    uplift_scores: np.ndarray,
-    steps: int = 20,
-) -> pd.DataFrame:
-    """Build a capacity curve: cumulative churns prevented vs. fraction targeted.
-
-    For each step from 0 % to 100 %, compute how many **incremental
-    churns** would be prevented if we target the top *k*% by predicted
-    uplift.
-
-    Parameters
-    ----------
-    y : np.ndarray
-        Binary churn labels (1 = churned).
-    treatment : np.ndarray
-        Binary treatment indicator.
-    uplift_scores : np.ndarray
-        Predicted uplift scores (higher = more benefit).
-    steps : int
-        Number of evenly spaced capacity levels between 0 and 1.
-
-    Returns
-    -------
-    pd.DataFrame
-        Columns: ``fraction_targeted``, ``incremental_churn_reduction``,
-        ``churns_prevented``, ``churns_per_1k_outreaches``.
-    """
-    fractions = np.linspace(0, 1, steps + 1)[1:]  # skip 0%
-    rows = []
-    for frac in fractions:
-        stats = compute_incremental_churn_at_k(y, treatment, uplift_scores, frac)
-        churns_prev = stats["churns_prevented"]
-        n_targeted = stats["n_targeted"]
-        # Churns prevented per 1,000 outreaches
-        per_1k = (churns_prev / n_targeted * 1000) if (n_targeted > 0 and not np.isnan(churns_prev)) else np.nan
-        rows.append({
-            "fraction_targeted": frac,
-            "incremental_churn_reduction": stats["incremental_churn_reduction"],
-            "churns_prevented": churns_prev,
-            "churns_per_1k_outreaches": per_1k,
-        })
-    return pd.DataFrame(rows)
-
-
-def plot_capacity_curve(
-    capacity_df: pd.DataFrame,
-    title: str = "Capacity curve — incremental churns prevented by contact rate",
-    figsize: tuple = (9, 5),
-) -> None:
-    """Plot cumulative incremental churns prevented vs. fraction of users targeted.
-
-    Shows where marginal benefit flattens: beyond a certain contact rate,
-    each additional outreach prevents fewer churns.
-
-    Parameters
-    ----------
-    capacity_df : pd.DataFrame
-        Output of ``build_capacity_curve_data``.
-    title : str
-        Plot title.
-    figsize : tuple
-        Figure size.
-
-    Returns
-    -------
-    None
-        Displays the plot.
-    """
-    fig, ax1 = plt.subplots(figsize=figsize)
-    fracs = capacity_df["fraction_targeted"] * 100  # percent
-
-    # Primary axis: cumulative churns prevented
-    color1 = "#2c7bb6"
-    ax1.plot(fracs, capacity_df["churns_prevented"], color=color1,
-             marker="o", markersize=4, linewidth=2, label="Churns prevented")
-    ax1.set_xlabel("% of users contacted", fontsize=12)
-    ax1.set_ylabel("Cumulative churns prevented (count)", fontsize=12, color=color1)
-    ax1.tick_params(axis="y", labelcolor=color1)
-
-    # Secondary axis: churns per 1k outreaches (efficiency)
-    ax2 = ax1.twinx()
-    color2 = "#d7191c"
-    ax2.plot(fracs, capacity_df["churns_per_1k_outreaches"], color=color2,
-             marker="s", markersize=4, linewidth=2, linestyle="--",
-             label="Churns prevented per 1k outreaches")
-    ax2.set_ylabel("Churns prevented per 1,000 outreaches", fontsize=12, color=color2)
-    ax2.tick_params(axis="y", labelcolor=color2)
-
-    ax1.set_title(title, fontsize=13, fontweight="bold")
-    ax1.spines["top"].set_visible(False)
-    ax2.spines["top"].set_visible(False)
-
-    # Combine legends
-    lines1, labels1 = ax1.get_legend_handles_labels()
-    lines2, labels2 = ax2.get_legend_handles_labels()
-    ax1.legend(lines1 + lines2, labels1 + labels2, loc="center right", fontsize=10)
-
-    fig.tight_layout()
-
-
-def build_segment_quality_table(
-    y: np.ndarray,
-    treatment: np.ndarray,
-    uplift_scores: np.ndarray,
-    segments: np.ndarray,
-) -> pd.DataFrame:
-    """Per-segment quality table with realised churn rates and uplift.
-
-    For each segment reports size, average predicted uplift, churn rate
-    in treated vs. control, and realised incremental churn reduction.
-
-    Parameters
-    ----------
-    y : np.ndarray
-        Binary churn labels (1 = churned).
-    treatment : np.ndarray
-        Binary treatment indicator.
-    uplift_scores : np.ndarray
-        Predicted uplift scores.
-    segments : np.ndarray
-        Segment labels (e.g. "Persuadables", "Sure Things", etc.).
-
-    Returns
-    -------
-    pd.DataFrame
-        One row per segment with quality metrics.
-    """
-    y = np.asarray(y)
-    treatment = np.asarray(treatment)
-    uplift_scores = np.asarray(uplift_scores)
-    segments = np.asarray(segments)
-
-    seg_order = ["Persuadables", "Sure Things", "Lost Causes", "Do-Not-Disturb"]
-    rows = []
-    for seg in seg_order:
-        mask = segments == seg
-        n = mask.sum()
-        if n == 0:
-            continue
-        y_seg = y[mask]
-        t_seg = treatment[mask]
-        u_seg = uplift_scores[mask]
-
-        n_treated = (t_seg == 1).sum()
-        n_control = (t_seg == 0).sum()
-        churn_treated = y_seg[t_seg == 1].mean() if n_treated > 0 else np.nan
-        churn_control = y_seg[t_seg == 0].mean() if n_control > 0 else np.nan
-        realised_uplift = (churn_control - churn_treated) if (n_treated > 0 and n_control > 0) else np.nan
-
-        rows.append({
-            "Segment": seg,
-            "N": n,
-            "Share (%)": round(n / len(y) * 100, 1),
-            "Avg predicted uplift": round(u_seg.mean(), 4),
-            "Churn rate (treated)": round(churn_treated, 4) if not np.isnan(churn_treated) else np.nan,
-            "Churn rate (control)": round(churn_control, 4) if not np.isnan(churn_control) else np.nan,
-            "Realised uplift": round(realised_uplift, 4) if not np.isnan(realised_uplift) else np.nan,
-        })
-    return pd.DataFrame(rows)
 
 
 def build_business_metrics_summary(
@@ -5822,61 +5000,19 @@ def build_business_metrics_summary(
         churns_prevented_pct = (inc * 100) if not np.isnan(inc) else np.nan
 
         row = {
-            "Top k% (%)": f"{k*100:.0f}%",
+            "Top k% (%)": f"{k * 100:.0f}%",
             "N targeted (n)": n_target,
             "Churn treated (fraction)": round(churn_stats["churn_rate_treated"], 4),
             "Churn control (fraction)": round(churn_stats["churn_rate_control"], 4),
-            "Churns prevented (%)": round(churns_prevented_pct, 2) if not np.isnan(churns_prevented_pct) else np.nan,
-            "Lift over random (ratio)": round(lift_stats["lift_ratio"], 2) if not np.isnan(lift_stats["lift_ratio"]) else np.nan,
+            "Churns prevented (%)": round(churns_prevented_pct, 2)
+            if not np.isnan(churns_prevented_pct)
+            else np.nan,
+            "Lift over random (ratio)": round(lift_stats["lift_ratio"], 2)
+            if not np.isnan(lift_stats["lift_ratio"])
+            else np.nan,
         }
         rows.append(row)
     return pd.DataFrame(rows)
-
-
-def plot_business_churns_prevented_bar(
-    summary_df: pd.DataFrame,
-    title: str = "Churns prevented by targeting top k%",
-    figsize: tuple = (8, 4),
-) -> None:
-    """Bar chart of churns prevented (%) at each top-k% threshold (for stakeholder presentation).
-
-    Parameters
-    ----------
-    summary_df : pd.DataFrame
-        Output of ``build_business_metrics_summary`` (must have "Top k% (%)" and "Churns prevented (%)").
-    title : str
-        Plot title.
-    figsize : tuple
-        Figure size (width, height).
-
-    Returns
-    -------
-    None
-        Displays the plot.
-    """
-    col_k = "Top k% (%)"
-    col_cp = "Churns prevented (%)"
-    if col_cp not in summary_df.columns:
-        return
-    fig, ax = plt.subplots(figsize=figsize)
-    x_labels = summary_df[col_k].astype(str)
-    vals = summary_df[col_cp].values
-    vals_plot = np.where(np.isnan(vals), 0.0, vals)
-    x_pos = np.arange(len(x_labels))
-    bars = ax.bar(x_pos, vals_plot, color="#2c7bb6", edgecolor="none")
-    ax.set_xticks(x_pos)
-    ax.set_xticklabels(x_labels)
-    ax.set_xlabel("Top k% targeted (%)", fontsize=11)
-    ax.set_ylabel("Churns prevented (%)", fontsize=11)
-    ax.set_title(title, fontsize=12, fontweight="bold")
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    for i, (bar, v) in enumerate(zip(bars, vals)):
-        if not np.isnan(v):
-            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5, f"{v:.2f}",
-                    ha="center", va="bottom", fontsize=9)
-    fig.tight_layout()
-    plt.show()
 
 
 def plot_business_incremental_reduction_bar(
@@ -5921,211 +5057,3 @@ def plot_business_incremental_reduction_bar(
     ax.spines["right"].set_visible(False)
     fig.tight_layout()
     plt.show()
-
-
-def plot_business_lift_over_random_bar(
-    summary_df: pd.DataFrame,
-    title: str = "Lift over random targeting by top k%",
-    figsize: tuple = (8, 4),
-) -> None:
-    """Bar chart of lift over random at each top-k% threshold.
-
-    Parameters
-    ----------
-    summary_df : pd.DataFrame
-        Output of ``build_business_metrics_summary`` ("Top k% (%)", "Lift over random (ratio)").
-    title : str
-        Plot title.
-    figsize : tuple
-        Figure size.
-
-    Returns
-    -------
-    None
-        Displays the plot.
-    """
-    col_k = "Top k% (%)"
-    col_lift = "Lift over random (ratio)"
-    if col_lift not in summary_df.columns:
-        return
-    fig, ax = plt.subplots(figsize=figsize)
-    x_labels = summary_df[col_k].astype(str)
-    vals = summary_df[col_lift].values
-    vals_plot = np.where(np.isnan(vals), 0.0, vals)
-    x_pos = np.arange(len(x_labels))
-    ax.bar(x_pos, vals_plot, color="#2c7bb6", edgecolor="none")
-    ax.set_xticks(x_pos)
-    ax.set_xticklabels(x_labels)
-    ax.set_xlabel("Top k% targeted (%)", fontsize=11)
-    ax.set_ylabel("Lift over random (ratio)", fontsize=11)
-    ax.set_title(title, fontsize=12, fontweight="bold")
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    fig.tight_layout()
-    plt.show()
-
-
-def plot_business_revenue_saved_bar(
-    summary_df: pd.DataFrame,
-    title: str = "Revenue saved by targeting top k%",
-    figsize: tuple = (8, 4),
-) -> None:
-    """Bar chart of revenue saved at each top-k% (no-op; revenue column removed from summary).
-
-    Parameters
-    ----------
-    summary_df : pd.DataFrame
-        Output of ``build_business_metrics_summary`` (no revenue column by default).
-    title : str
-        Plot title.
-    figsize : tuple
-        Figure size.
-
-    Returns
-    -------
-    None
-        Displays the plot. No-op if "Revenue saved" column is missing.
-    """
-    if "Revenue saved" not in summary_df.columns:
-        return
-    fig, ax = plt.subplots(figsize=figsize)
-    x_labels = summary_df["Top k%"].astype(str)
-    vals = summary_df["Revenue saved"].values
-    vals_plot = np.where(np.isnan(vals), 0.0, vals)
-    x_pos = np.arange(len(x_labels))
-    bars = ax.bar(x_pos, vals_plot, color="#2ca02c", edgecolor="none")
-    ax.set_xticks(x_pos)
-    ax.set_xticklabels(x_labels)
-    ax.set_xlabel("Top k% targeted (%)", fontsize=11)
-    ax.set_ylabel("Revenue saved ($)", fontsize=11)
-    ax.set_title(title, fontsize=12, fontweight="bold")
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    for bar, v in zip(bars, vals):
-        if not np.isnan(v):
-            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5, f"${v:,.0f}",
-                    ha="center", va="bottom", fontsize=9)
-    fig.tight_layout()
-    plt.show()
-
-
-def plot_segment_quality_grouped_bar(
-    segment_df: pd.DataFrame,
-    title: str = "Segment quality: churn rate (treated vs control)",
-    figsize: tuple = (8, 4),
-) -> None:
-    """Grouped bar chart: per-segment churn rate (treated vs control) for stakeholder presentation.
-
-    Parameters
-    ----------
-    segment_df : pd.DataFrame
-        Output of ``build_segment_quality_table`` (columns: Segment, Churn rate (treated), Churn rate (control)).
-    title : str
-        Plot title.
-    figsize : tuple
-        Figure size.
-
-    Returns
-    -------
-    None
-        Displays the plot.
-    """
-    if "Churn rate (treated)" not in segment_df.columns or "Churn rate (control)" not in segment_df.columns:
-        return
-    fig, ax = plt.subplots(figsize=figsize)
-    segments = segment_df["Segment"].astype(str)
-    x = np.arange(len(segments))
-    w = 0.35
-    treated = segment_df["Churn rate (treated)"].fillna(0).values
-    control = segment_df["Churn rate (control)"].fillna(0).values
-    ax.bar(x - w / 2, treated, w, label="Churn (treated)", color="#2c7bb6")
-    ax.bar(x + w / 2, control, w, label="Churn (control)", color="#d7191c", alpha=0.8)
-    ax.set_xticks(x)
-    ax.set_xticklabels(segments)
-    ax.set_xlabel("Segment", fontsize=11)
-    ax.set_ylabel("Churn rate (fraction; 0–1)", fontsize=11)
-    ax.set_title(title, fontsize=12, fontweight="bold")
-    ax.legend(loc="upper right", fontsize=10)
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    fig.tight_layout()
-    plt.show()
-
-
-def compute_and_print_baseline_benchmark(
-    y: np.ndarray,
-    treatment: np.ndarray,
-    benchmark_financial: tuple[float, float] = (2.0, 4.0),
-    benchmark_wellness: tuple[float, float] = (7.0, 10.0),
-    print_result: bool = True,
-) -> dict:
-    """Compare churn with outreach (treated) to industry benchmarks; control reported for context.
-
-    The meaningful comparison for stakeholders is: when we do outreach (treated
-    group), where does our churn sit vs. 2–4% (financial) and 7–10% (wellness)?
-    Control (no outreach) churn is reported only as context.
-
-    Parameters
-    ----------
-    y : np.ndarray
-        Binary churn labels (1 = churned).
-    treatment : np.ndarray
-        Binary treatment indicator (0 = control, 1 = treated/outreach).
-    benchmark_financial : tuple[float, float]
-        (low, high) monthly churn % for financial benchmark. Default (2, 4).
-    benchmark_wellness : tuple[float, float]
-        (low, high) monthly churn % for wellness benchmark. Default (7, 10).
-    print_result : bool
-        If True, print control (context), treated churn, and benchmark comparison.
-
-    Returns
-    -------
-    dict
-        Keys: ``control_churn_pct``, ``n_control``, ``treated_churn_pct``,
-        ``n_treated``, ``vs_financial``, ``vs_wellness`` (comparison for treated).
-    """
-    y_arr = np.asarray(y)
-    t_arr = np.asarray(treatment)
-    control_mask = t_arr == 0
-    treated_mask = t_arr == 1
-    n_control = int(control_mask.sum())
-    n_treated = int(treated_mask.sum())
-
-    control_churn_rate = float(y_arr[control_mask].mean()) if n_control > 0 else np.nan
-    treated_churn_rate = float(y_arr[treated_mask].mean()) if n_treated > 0 else np.nan
-    control_churn_pct = control_churn_rate * 100 if not np.isnan(control_churn_rate) else np.nan
-    treated_churn_pct = treated_churn_rate * 100 if not np.isnan(treated_churn_rate) else np.nan
-
-    # Compare *treated* (with outreach) churn to benchmarks
-    pct = treated_churn_pct if not np.isnan(treated_churn_pct) else 0.0
-    fin_lo, fin_hi = benchmark_financial
-    if pct < fin_lo:
-        vs_fin = "below the 2–4% financial/subscription benchmark"
-    elif pct <= fin_hi:
-        vs_fin = "within the 2–4% financial/subscription benchmark"
-    else:
-        vs_fin = "above the 2–4% financial/subscription benchmark"
-
-    well_lo, well_hi = benchmark_wellness
-    if pct < well_lo:
-        vs_well = "below the 7–10% wellness/engagement benchmark"
-    elif pct <= well_hi:
-        vs_well = "within the 7–10% wellness/engagement benchmark"
-    else:
-        vs_well = "above the 7–10% wellness/engagement benchmark"
-
-    out = {
-        "control_churn_rate": control_churn_rate,
-        "control_churn_pct": control_churn_pct,
-        "n_control": n_control,
-        "treated_churn_rate": treated_churn_rate,
-        "treated_churn_pct": treated_churn_pct,
-        "n_treated": n_treated,
-        "vs_financial": vs_fin,
-        "vs_wellness": vs_well,
-    }
-    if print_result:
-        print(f"Control (no outreach) monthly churn: {control_churn_pct:.2f}% (n={n_control:,}).")
-        print(f"Treated (with outreach) monthly churn: {treated_churn_pct:.2f}% (n={n_treated:,}).")
-        print(f"When we do outreach, churn is {vs_fin} and {vs_well}.")
-    return out
