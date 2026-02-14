@@ -684,7 +684,7 @@ def plot_correlation_diagnostics(
         )
     feature_cols_use = cols_nonconst if cols_nonconst else feature_cols
     corr = df_clean[feature_cols_use].corr()
-    # For display only: treat near-zero correlations as 0 so we show "0.00" instead of "-0.00" / "0.00" (zero is zero).
+    # For display only: treat near-zero correlations as 0.
     corr_display = corr.copy()
     corr_display[np.abs(corr_display) < 0.005] = 0.0
     n = len(feature_cols_use)
@@ -4507,7 +4507,7 @@ def plot_shap_importance_bar(
         shap_values = shap_values.reshape(shap_values.shape[0], -1)
 
     n_features = shap_values.shape[1]
-    # Align feature names: use only as many as we have columns
+    # Align feature names
     names = list(feature_names)[:n_features]
     if len(names) < n_features:
         names = names + [f"f{i}" for i in range(len(names), n_features)]
@@ -4836,7 +4836,7 @@ def compute_incremental_churn_at_k(
 ) -> dict:
     """Compute incremental churn reduction when targeting the top *k*% by uplift.
 
-    Among the top *k*% of users (ranked by predicted uplift), we compare
+    Among the top *k*% of users (ranked by predicted uplift), I compare
     churn rates between treated and control groups.  The difference is the
     **realised incremental churn reduction** attributable to the treatment.
 
