@@ -1,4 +1,4 @@
-# WellCo Churn Prevention — Uplift Modeling
+# WellCo Churn Prevention - Uplift Modeling
 
 Prioritized outreach list for WellCo by ranking members on predicted **uplift** (reduction in churn if contacted). The final ranked list is produced on the provided test set.
 
