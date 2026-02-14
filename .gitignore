@@ -1,10 +1,17 @@
-# Only track files under src/ (and this .gitignore, README, requirements)
+# Only track files under src/ (and this .gitignore, README, requirements, files/)
 # Ignore all files and directories at repo root
 /*
 !.gitignore
 !/src
+!/files
 !README.md
 !requirements.txt
+
+# files/ — track dir but ignore large data, schema docs, and brief
+files/train/
+files/test/
+files/schema_*.md
+files/wellco_client_brief.txt
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

@@ -107,11 +107,11 @@ Run from the **`src/`** directory (so that paths resolve correctly).
 
 ```
 ├── files/                    # Data (create and populate)
-│   ├── train/                # Training CSVs
-│   ├── test/                 # Test CSVs
+│   ├── train/                # Training CSVs - not in git
+│   ├── test/                 # Test CSVs - not in git
 │   ├── engineered/           # Created by EDA notebook
 │   ├── top_n_members_outreach.csv   # Final deliverable (created by uplift notebook)
-│   └── wellco_client_brief.txt
+│   └── wellco_client_brief.txt - not in git
 ├── src/
 │   ├── uplift_churn_EDA.ipynb
 │   ├── uplift_churn_prediction.ipynb
